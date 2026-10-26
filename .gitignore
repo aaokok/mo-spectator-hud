@@ -3,6 +3,9 @@
 **/*.rs.bk
 Cargo.lock
 
+# Compiled binaries
+*.exe
+
 # Node / Web / NPM
 **/node_modules/
 package-lock.json

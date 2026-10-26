@@ -19,7 +19,7 @@
     "resources": {
       "../overlay": "demo/",
       "../console": "hud/",
-      "../../release/hud_bridge.exe": "hud_bridge.exe",
+      "../bridge/hud_bridge.exe": "hud_bridge.exe",
       "../../assets/icons": "icons/"
     }
   }
