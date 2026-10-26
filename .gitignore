@@ -6,6 +6,11 @@ Cargo.lock
 # Compiled binaries
 *.exe
 
+# Release runtime directory (assembled dynamically; only track README.md and .gitkeep)
+/release/*
+!/release/README.md
+!/release/.gitkeep
+
 # Node / Web / NPM
 **/node_modules/
 package-lock.json
