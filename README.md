@@ -7,6 +7,10 @@
 
 **MO Spectator HUD** 是专为《命令与征服：尤里的复仇》知名大型 Mod《心灵终结 3.3.6 (Mental Omega 3.3.6)》打造的现代化观战实时浮层系统。系统采用**“底层只读数据桥 + 统一渲染核心 + 双外壳（桌面透明浮层 / OBS 浏览器源）”**的高内聚架构，为赛事直播、导播解说与回放复盘提供赛事实时数据透视与 UI 渲染。
 
+> 🛡️ **关于防滥用与二进制说明**：
+> 为防止游戏辅助化滥用、非授权恶意篡改及保护竞技对局公平性，**本开源仓库不直接分发预编译的可执行二进制文件 (`.exe`)**。
+> 本项目代码完全开源透明，允许并鼓励赛事举办方、官方导播员及社区开发者在遵守开源协议与免责声明的前提下**自行从源码编译使用**。仓库内保留了 `release/` 目录结构作为标准独立便携包模版。
+
 ---
 
 ## ✨ 核心特性
@@ -61,21 +65,53 @@ flowchart TD
 
 ---
 
-## 🚀 快速使用（编译免安装版）
+## 🛠️ 源码构建与组装指南
 
-进入仓库的 `release/` 目录即可开箱即用：
+由于本仓库不提供二进制成品，使用前请先自行编译底层桥与客户端外壳：
 
-### 方案 1：客户端一键启动（推荐）
+### 1. 编译底层数据桥 (`hud_bridge.exe`)
+- **环境需求**：Visual Studio（包含 C++ 桌面开发工作负载，x86 模式）。
+- 进入 `src/bridge/` 目录，执行构建批处理：
+  ```cmd
+  build_bridge.bat
+  ```
+  编译完成后，将在该目录下生成 `hud_bridge.exe`。
+
+### 2. 编译桌面客户端外壳 (`mo_hud.exe`)
+- **环境需求**：安装 Rust 工具链（`rustc`、`cargo`）及 Windows 10/11 系统自带的 WebView2。
+- 进入 `src/app/` 目录，执行 Release 模式构建：
+  ```cmd
+  cargo build --release
+  ```
+  编译产物位于 `src/app/target/release/mo_hud.exe`。
+
+### 3. 组装便携 Release 包（推荐）
+为了拥有开箱即用的独立运行环境，建议将产物组装至 `release/` 目录（详见 [`release/README.md`](release/README.md)）：
+1. 将 `src/bridge/hud_bridge.exe` 复制到 `release/`；
+2. 将 `src/app/target/release/mo_hud.exe` 复制到 `release/`；
+3. 将 `src/overlay/` 整体复制并命名为 `release/demo/`；
+4. 将 `src/console/` 整体复制并命名为 `release/hud/`；
+5. 将 `assets/icons/` 整体复制到 `release/icons/`；
+6. 将 `assets/icons_manifest.json` 与 `assets/heroes.json` 复制到 `release/`；
+7. 在 `release/` 下创建空的 `out/` 文件夹。
+
+---
+
+## 🚀 运行与使用
+
+组装好 Release 包后，即可按以下方式使用：
+
+### 方案 1：桌面客户端一键启动（推荐）
 1. 启动游戏《心灵终结 3.3.6》并进入对局（或打开回放录像）；
 2. 双击运行 `release/mo_hud.exe`；
-3. 程序将自动托管数据桥、启动内嵌服务，并在游戏画面上方浮现透明 HUD 覆盖层；
+3. 程序将自动拉起数据桥子进程、启动本地服务，并在游戏画面上方浮现透明 HUD 覆盖层；
 4. 同时会自动弹出 Web 控制台窗口，可随时修改比赛名、局分或排查环境；
 5. **快捷键**：
    - <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>H</kbd> ：显隐 HUD 覆盖窗口
    - <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>T</kbd> ：置顶 / 取消置顶
 
 ### 方案 2：OBS 直播导播推流
-1. 运行 `release/mo_hud.exe` 启动服务；
+1. 运行客户端启动服务（或运行 `src/overlay/serve.py`）；
 2. 在 OBS 来源面板中添加 **「浏览器」 (Browser Source)**；
 3. 参数配置：
    - **URL**：`http://127.0.0.1:8770/overlay`
@@ -83,11 +119,12 @@ flowchart TD
    - **帧率**：`30` 或 `60`
 4. 背景天然全透明，无需添加色键滤镜即可完美叠放在游戏画面上。
 
-### 方案 3：轻量 Python 独立服务（无客户端）
-若不想运行桌面窗口，仅需供 OBS 采集：
-1. 打开 `src/overlay/` 目录；
-2. 运行 `启动覆盖层.bat`（或执行 `python serve.py`）；
-3. 复制终端中输出的地址填入 OBS 浏览器源即可。
+### 方案 3：开发者调试运行
+开发者无需组装 Release 目录，直接在 `src/app/` 下运行：
+```cmd
+cargo run
+```
+内置路径解析机制会自动向上索引 `src/overlay/` 与 `assets/` 资源目录。
 
 ---
 
@@ -99,7 +136,7 @@ mo-spectator-hud/
 ├── README.md                # 统一项目说明文档
 ├── LICENSE                  # MIT 开源协议
 │
-├── src/                     # 源码目录
+├── src/                     # 源代码目录
 │   ├── bridge/              # 底层只读数据桥 (Win32 C 原生实现)
 │   │   ├── hud_bridge.c     # 内存字段采集与状态序列化
 │   │   ├── build_bridge.bat # MSVC x86 快速构建脚本
@@ -126,34 +163,10 @@ mo-spectator-hud/
 │   ├── icons_manifest.json  # 图标元数据映射表
 │   └── heroes.json          # 英雄单位口径与特效映射
 │
-└── release/                 # 预编译免安装独立发布包
-    ├── mo_hud.exe           # Tauri 2 启动器二进制文件
-    ├── hud_bridge.exe       # 数据桥二进制文件
-    ├── demo/                # 浮层静态资源
-    ├── hud/                 # 控制台静态资源
-    ├── icons/               # 运行时图标库
-    ├── out/                 # 动态数据输出目录 (.gitkeep 占位)
-    └── 使用说明.txt
+└── release/                 # 便携发布与部署目录（供用户放置自行编译产物）
+    ├── README.md            # 便携包组装规范指引
+    └── .gitkeep             # 目录占位保持
 ```
-
----
-
-## 🛠️ 源码构建指南
-
-### 1. 编译底层数据桥 (`hud_bridge.exe`)
-- 环境需求：安装了 C++ 工具链的 Visual Studio（x86 模式）。
-- 进入 `src/bridge/`，直接运行：
-  ```cmd
-  build_bridge.bat
-  ```
-
-### 2. 编译桌面客户端 (`mo_hud.exe`)
-- 环境需求：Rust 工具链（`cargo` / `rustc`）与系统 WebView2。
-- 进入 `src/app/`：
-  ```cmd
-  cargo build --release
-  ```
-- 编译产物位于 `target/release/mo_hud.exe`。
 
 ---
 
@@ -161,7 +174,7 @@ mo-spectator-hud/
 
 1. 本项目仅供《心灵终结 3.3.6》赛事观战、解说录播与对局复盘使用。
 2. 数据桥采用只读方式读取公共对局状态，请勿将其用于非法用途或破坏游戏公平竞争环境。
-3. 《心灵终结》(Mental Omega) 相关美术资源归属原制作组与 EA 所有。
+3. 《心灵终结》(Mental Omega) 相关美术与游戏资产版权归属原制作组与 EA 所有。
 
 ---
 
