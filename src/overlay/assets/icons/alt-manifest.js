@@ -1,0 +1,25 @@
+/* 由 assets/icons/*_v.png 生成：只有 art 段声明了 AltCameoPCX 的单位才有老兵图标。
+   真实环境应改为读 icons_manifest.json 的 alt_png 字段。 */
+window.ALT_CAMEO = {
+  "APOC": 1,
+  "BRUTE": 1,
+  "DESO": 1,
+  "DEVO": 1,
+  "DISK": 1,
+  "E1": 1,
+  "E2": 1,
+  "FLAKT": 1,
+  "HARP": 1,
+  "HTNK": 1,
+  "HURR": 1,
+  "IVAN": 1,
+  "KNIGHT": 1,
+  "LTNK": 1,
+  "MIND": 1,
+  "QUETZ": 1,
+  "SHK": 1,
+  "TANY": 1,
+  "YDOG": 1,
+  "YTNK": 1,
+  "ZEP": 1,
+};

@@ -1,0 +1,31 @@
+{
+ "source": "mo_extract/mo3399_rules.ini",
+ "key": "Hero=yes",
+ "occurrences": 15,
+ "count": 16,
+ "ids": [
+  "TANY",
+  "ARMR",
+  "SIEG",
+  "MORALES",
+  "VOLKOV",
+  "CHITZ",
+  "YUNRU",
+  "ASSN",
+  "UNDER",
+  "LIBRA",
+  "SIBFIN",
+  "SICALI",
+  "EUREKA",
+  "URAGAN",
+  "CYCOM",
+  "KRUKOV"
+ ],
+ "extra": {
+  "KRUKOV": "未挂 Hero=yes，但 BuildLimit=1+英雄星级+NAHAND,NATECHR 前置，实测对局存在",
+  "UNDER": "Malver。未挂 Hero=yes（Image=INTRUDER，art 段名脱节），BuildLimit=1 尤里英雄，实测对局存在"
+ },
+ "excluded": {
+  "AIMORA": "Prerequisite 含 AILOCK（AI 专用锁定建筑），真人对局不出现"
+ }
+}

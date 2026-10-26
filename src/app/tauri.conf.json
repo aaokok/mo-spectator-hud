@@ -1,0 +1,26 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MO Spectator HUD",
+  "version": "0.1.0",
+  "identifier": "com.mospectator.hud",
+  "build": {
+    "frontendDist": "../console"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
+    "resources": {
+      "../overlay": "demo/",
+      "../console": "hud/",
+      "../../release/hud_bridge.exe": "hud_bridge.exe",
+      "../../assets/icons": "icons/"
+    }
+  }
+}

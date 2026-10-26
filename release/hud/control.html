@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MO 观战 HUD · 控制台</title>
+<script>
+/* 先于样式表执行：避免加载瞬间闪一下相反的配色 */
+(function () {
+  try {
+    var t = localStorage.getItem('mo_hud.theme');
+    document.documentElement.dataset.theme = t === 'dark' ? 'dark' : 'light';
+  } catch (e) { document.documentElement.dataset.theme = 'light'; }
+})();
+</script>
+<link rel="stylesheet" href="/ui/control.css">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ================= 左侧导航 ================= -->
+  <aside class="rail">
+    <div class="brand">
+      <div class="mark">MO</div>
+      <div class="ver">v0.1.0</div>
+    </div>
+    <nav class="nav" id="nav">
+      <button data-page="overview" class="on" aria-current="page">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+        <span>总览</span>
+      </button>
+      <button data-page="display">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        <span>画面</span>
+      </button>
+      <button data-page="units">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 8.5 12 3l9 5.5v7L12 21l-9-5.5z"/><path d="M3 8.5 12 14l9-5.5M12 14v7"/></svg>
+        <span>单位</span>
+      </button>
+      <button data-page="env">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5.5c0 4-3 7-7 8.5-4-1.5-7-4.5-7-8.5V6z"/><path d="m9 12 2 2 4-4"/></svg>
+        <span>环境</span>
+      </button>
+      <button data-page="logs">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 10h10M4 15h13M4 20h7"/></svg>
+        <span>日志</span>
+      </button>
+      <div class="sep"></div>
+      <button data-page="tutorial">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4.5h6.5A2.5 2.5 0 0 1 13 7v13a2 2 0 0 0-2-2H4z"/><path d="M20 4.5h-4.5A2.5 2.5 0 0 0 13 7v13a2 2 0 0 1 2-2h5z"/></svg>
+        <span>使用教程</span>
+      </button>
+      <button data-page="help">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 0 1 4.7 1.2c0 1.8-2.2 2-2.2 3.4"/><circle cx="12" cy="17.2" r=".9" fill="currentColor" stroke="none"/></svg>
+        <span>帮助</span>
+      </button>
+    </nav>
+    <div class="bottom">
+      <div class="live-dot" id="railDot"></div>
+      <div id="railPort">—</div>
+    </div>
+  </aside>
+
+  <!-- ================= 主区 ================= -->
+  <div class="main">
+
+    <!-- 全局状态条 -->
+    <div class="statusbar">
+      <div class="title" id="pageTitle">总览</div>
+      <div class="pills">
+        <span class="pill" id="pillBridge"><span class="d"></span>数据桥 <b>…</b></span>
+        <span class="pill" id="pillHud"><span class="d"></span>HUD <b>…</b></span>
+        <span class="pill" id="pillGame"><span class="d"></span>对局 <b>…</b></span>
+        <span class="pill" id="pillData"><span class="d"></span>数据 <b>…</b></span>
+      </div>
+      <div class="acts">
+        <button class="btn" id="btnTheme" title="切换浅色 / 深色" aria-label="切换配色">
+          <svg class="ico-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8.2 8.2 0 0 0 10.5 10.5z"/></svg>
+          <svg class="ico-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.2 5.2l1.4 1.4M17.4 17.4l1.4 1.4M18.8 5.2l-1.4 1.4M6.6 17.4l-1.4 1.4"/></svg>
+        </button>
+        <button class="btn" id="btnCopy">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M15 5H6a2 2 0 0 0-2 2v9"/></svg>
+          <span class="btnTxt">复制 OBS 地址</span>
+        </button>
+        <button class="btn primary" id="btnHud">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.6"/></svg>
+          <span id="btnHudTxt">隐藏 HUD</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="content" id="content">
+
+      <!-- ============================ 总览 ============================ -->
+      <div class="page on" id="page-overview">
+        <div class="stats" id="stats">
+        <div class="stat" id="statBridge">
+          <div class="hd"><span class="d"></span><span class="name">数据桥</span><span class="val">…</span></div>
+          <div class="big" id="sbSampling">—</div>
+          <div class="meta" id="sbMeta"></div>
+          <div class="foot" id="sbFoot"></div>
+          <div class="bar"><i id="sbBar" style="width:0"></i></div>
+        </div>
+        <div class="stat" id="statGame">
+          <div class="hd"><span class="d"></span><span class="name">游戏</span><span class="val">…</span></div>
+          <div class="big" id="sgElapsed">—</div>
+          <div class="meta" id="sgMeta"></div>
+          <div class="foot" id="sgFoot"></div>
+          <div class="bar"><i id="sgBar" style="width:0"></i></div>
+        </div>
+        <div class="stat" id="statOverlay">
+          <div class="hd"><span class="d"></span><span class="name">覆盖层</span><span class="val">…</span></div>
+          <div class="big" id="soCount">—</div>
+          <div class="meta" id="soMeta"></div>
+          <div class="foot" id="soFoot"></div>
+          <div class="bar"><i id="soBar" style="width:0"></i></div>
+        </div>
+        <div class="stat" id="statData">
+          <div class="hd"><span class="d"></span><span class="name">数据</span><span class="val">…</span></div>
+          <div class="big" id="sdAge">—</div>
+          <div class="meta" id="sdMeta"></div>
+          <div class="foot" id="sdFoot"></div>
+          <div class="bar"><i id="sdBar" style="width:0"></i></div>
+        </div>
+        </div>
+
+        <div class="notice" id="envNotice" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5 21 19H3z"/><path d="M12 9.5v4M12 16.5v.6"/></svg>
+        <span id="envNoticeTxt"></span>
+        <span class="right">
+          <button class="btn sm ghost" data-goto="env">查看详情</button>
+          <button class="btn sm ghost" id="btnReport">复制报告</button>
+        </span>
+        </div>
+
+        <div class="grid2" style="margin-top:14px">
+          <div class="left">
+            <section class="card" style="margin-top:0">
+              <header>
+                <h2>快捷控制</h2>
+                <span class="tag">OBS 同步</span>
+                <span class="right"><span class="count" id="qcount">—</span></span>
+              </header>
+              <div class="body" id="quickToggles"></div>
+            </section>
+
+            <section class="card">
+              <header>
+                <h2>本局速览</h2>
+                <span class="right"><span class="count" id="matchSrc">—</span></span>
+              </header>
+              <div class="body tight" id="matchBox">
+                <div class="matchinfo" id="matchInfo">
+                  <div class="mr"><span>地图</span><b id="miMap">—</b><span class="sep"></span><b id="miMode">—</b></div>
+                  <div class="mr"><span>观察者</span><b id="miObserver">—</b><span class="sep"></span><span>已进行</span><b id="miElapsed">—</b>
+                    <span class="right"><span class="chip" id="miDrops">—</span></span></div>
+                </div>
+                <table class="ptable">
+                  <thead><tr><th>玩家</th><th>阵营</th><th>资金</th><th>兵力</th><th>击杀</th><th>状态</th></tr></thead>
+                  <tbody id="ptableBody"><tr><td colspan="6" style="color:var(--dim);padding:14px 15px">等待数据…</td></tr></tbody>
+                </table>
+              </div>
+            </section>
+          </div>
+
+          <div class="right">
+            <div class="preview">
+              <header>
+                <h2>实时预览</h2>
+                <span class="live" id="previewLive"><span class="d"></span>LIVE</span>
+                <button class="pvbtn" id="btnPreviewToggle" title="关闭实时预览，停止加载 HUD 页面">关闭预览</button>
+              </header>
+              <div class="previewOff" id="previewOff">
+                <div class="txt"><b>实时预览已关闭</b>HUD 页面不再加载，可减少约一帧的渲染与轮询开销；HUD 本身不受影响。</div>
+                <button class="btn sm" id="btnPreviewOn">开启预览</button>
+              </div>
+              <div class="stagewrap">
+                <div class="stage" id="stage">
+                  <iframe id="previewFrame" title="HUD 实时预览" src="about:blank" allowtransparency="true"></iframe>
+                  <div class="placeholder" id="previewPh"><div><b>尚未收到数据帧</b>启动游戏进入对局后自动显示</div></div>
+                  <div class="ovl" id="stageOvl"><div><b id="ovlTitle"></b><span id="ovlSub"></span></div></div>
+                </div>
+                <div class="stagemeta">
+                  <span class="chip" id="chipRes">—</span>
+                  <span class="chip" id="chipFollow">—</span>
+                  <span class="chip" id="chipAge">—</span>
+                  <span class="right">
+                    <button class="btn sm ghost" id="btnFreeze">冻结</button>
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div class="card" style="margin-top:12px">
+              <header><h2>顶栏文案</h2><span class="right"><span class="count" id="copySrc">—</span></span></header>
+              <div class="body">
+                <div class="field"><label for="match_name">比赛名</label>
+                  <input type="text" id="match_name" placeholder="空 = 用数据原值"></div>
+                <div class="echo" id="echoMatch">当前显示：—</div>
+                <div class="field"><label for="score_l">局分</label>
+                  <div class="scorebox">
+                    <input type="text" id="score_l" inputmode="numeric" aria-label="左侧局分">
+                    <span class="colon">:</span>
+                    <input type="text" id="score_r" inputmode="numeric" aria-label="右侧局分">
+                  </div>
+                </div>
+                <div class="echo" id="echoScore">当前显示：—</div>
+                <div class="field"><label for="mode_label">模式</label>
+                  <input type="text" id="mode_label" placeholder="空 = 用游戏模式（LAN / 遭遇战…）"></div>
+                <div class="echo" id="echoMode">当前显示：—</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============================ 直播画面 ============================ -->
+      <div class="page" id="page-display">
+        <div class="grid2">
+          <div class="left">
+            <section class="card" style="margin-top:0">
+              <header>
+                <h2>画面模块</h2>
+                <span class="tag">本地覆盖窗口与 OBS 同时生效</span>
+                <span class="right"><span class="modflag" id="modModules"><span class="b"></span><span id="modModulesTxt"></span></span></span>
+              </header>
+              <div class="body" id="moduleToggles"></div>
+            </section>
+
+            <section class="card">
+              <header>
+                <h2>顶栏文案</h2>
+                <span class="tag">空值 = 使用游戏数据</span>
+                <span class="right"><button class="btn sm ghost" id="btnResetText">恢复全部</button></span>
+              </header>
+              <div class="body">
+                <div class="field"><label for="match_name2">比赛名</label>
+                  <input type="text" id="match_name2" placeholder="空 = 用数据原值">
+                  <button class="btn sm ghost" data-clear="match_name" title="恢复数据原值">⟳</button>
+                </div>
+                <div class="echo" id="echoMatch2">当前显示：—</div>
+                <div class="field"><label for="score_l2">局分</label>
+                  <div class="scorebox">
+                    <input type="text" id="score_l2" inputmode="numeric" aria-label="左侧局分">
+                    <span class="colon">:</span>
+                    <input type="text" id="score_r2" inputmode="numeric" aria-label="右侧局分">
+                  </div>
+                  <button class="btn sm ghost" data-clear="score" title="恢复数据原值">⟳</button>
+                </div>
+                <div class="echo" id="echoScore2">当前显示：—</div>
+                <div class="field"><label for="mode_label2">模式标签</label>
+                  <input type="text" id="mode_label2" placeholder="留空 = 使用游戏模式（LAN / 遭遇战…）">
+                  <button class="btn sm ghost" data-clear="mode_label" title="恢复数据原值">⟳</button>
+                </div>
+                <div class="echo" id="echoMode2">当前显示：—</div>
+                <div class="subhead"><span>顶栏布局</span>
+                  <span class="modflag" id="modLayout"><span class="b"></span><span id="modLayoutTxt"></span></span>
+                </div>
+                <div id="layoutToggles"></div>
+              </div>
+            </section>
+          </div>
+
+          <div class="right">
+            <section class="card" style="margin-top:0">
+              <header><h2>覆盖窗口</h2><span class="tag">仅本地</span></header>
+              <div class="body">
+                <div class="ovpills" id="ovpills">
+                  <span class="pill" id="ovPillVis"><span class="d"></span>…</span>
+                  <span class="pill" id="ovPillTop"><span class="d"></span>…</span>
+                  <span class="pill" id="ovPillFollow"><span class="d"></span>…</span>
+                </div>
+                <div class="ovacts">
+                  <button class="btn sm primary" id="btnOvVisible">隐藏 HUD</button>
+                  <button class="btn sm" id="btnOvTopmost">置顶</button>
+                </div>
+                <div id="overlayToggles"></div>
+              </div>
+            </section>
+
+            <section class="card">
+              <header>
+                <h2>全局热键</h2>
+                <span class="tag">默认关闭</span>
+                <span class="right"><span class="count" id="hotkeyStatusTxt">—</span></span>
+              </header>
+              <div class="body" id="hotkeyPanel">
+                <div id="hotkeyEnableRow"></div>
+                <div class="field">
+                  <label for="hotkey_visible">显隐</label>
+                  <input type="text" id="hotkey_visible" placeholder="如 ctrl+alt+h" spellcheck="false">
+                  <button class="btn sm" id="btnHotkeyCapture" data-target="hotkey_visible">录制</button>
+                </div>
+                <div class="field">
+                  <label for="hotkey_topmost">置顶</label>
+                  <input type="text" id="hotkey_topmost" placeholder="如 ctrl+alt+t" spellcheck="false">
+                  <button class="btn sm" id="btnHotkeyCapture2" data-target="hotkey_topmost">录制</button>
+                </div>
+                <div class="echo" id="hotkeyEcho">—</div>
+                <div class="ovacts" style="margin-top:8px">
+                  <button class="btn sm" id="btnHotkeyApply">应用热键</button>
+                  <button class="btn sm ghost" id="btnHotkeyReset">恢复默认键位</button>
+                </div>
+                <div class="hintbox" style="margin-top:10px" id="hotkeyHint">
+                  默认不注册任何全局热键。开启后按键格式为「修饰键+主键」，例如 ctrl+alt+h；
+                  被其他软件占用时会给出原因，程序仍可正常使用。
+                </div>
+              </div>
+            </section>
+
+            <section class="card">
+              <header><h2>这一页的影响范围</h2></header>
+              <div class="body pad" style="font-size:11.5px;color:var(--dim);line-height:1.8">
+                上半部分的开关都会同步到
+                <span class="scope sync" style="display:inline-flex;font:9.5px/1 Consolas,monospace;padding:2.5px 6px;border-radius:4px">OBS 浏览器源</span>；<br>
+                「覆盖窗口」里的三项只影响
+                <span class="scope local" style="display:inline-flex;font:9.5px/1 Consolas,monospace;padding:2.5px 6px;border-radius:4px">本地覆盖窗口</span>。<br>
+                两者共用同一份控制状态，刷新任何一端都不会丢配置。
+                <div class="hintbox" style="margin-top:10px">
+                  关掉覆盖窗口不影响直播：OBS 采集的是浏览器源，不是这个窗口。
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============================ 单位与图标 ============================ -->
+      <div class="page" id="page-units">
+        <section class="card" style="margin-top:0">
+          <div class="toolbar">
+            <input class="search" id="usearch" placeholder="搜索单位 ID（如 FLAKT / LIBRA）">
+            <select id="fClass" aria-label="按形态过滤"><option value="">形态：全部</option></select>
+            <select id="fSide" aria-label="按阵营过滤"><option value="">阵营：全部</option></select>
+            <select id="fState" aria-label="按状态过滤">
+              <option value="">状态：全部</option>
+              <option value="ovr">已换图</option>
+              <option value="hid">已隐藏</option>
+              <option value="mod">已修改</option>
+            </select>
+            <select id="cmode" aria-label="隐藏计数口径">
+              <option value="keep">计数：隐藏格保留 +N</option>
+              <option value="drop">计数：完全剔除</option>
+            </select>
+            <select id="uprio" aria-label="单位排序">
+              <option value='["hero","one","cnt"]'>排序：英雄 → 限1 → 数量</option>
+              <option value='["one","hero","cnt"]'>排序：限1 → 英雄 → 数量</option>
+              <option value='["cnt"]'>排序：仅数量降序</option>
+            </select>
+            <span class="sp"></span>
+            <span class="modflag" id="modUnits"><span class="b"></span><span id="modUnitsTxt"></span></span>
+            <button class="btn sm ghost" id="btnUnitsReset">恢复默认</button>
+          </div>
+          <div class="chipbar" id="tagbar"></div>
+          <div class="ulayout">
+            <div>
+              <div class="ulist" id="ulist">
+                <div style="padding:20px;color:var(--dim);font-size:12px">图标索引未加载（需 mo_hud.exe 或 serve.py 模式）。</div>
+              </div>
+              <div class="ustat" id="units-stat">
+                <span><b>—</b> 个单位</span>
+              </div>
+            </div>
+            <aside class="udetail" id="udetail">
+              <div class="ph">详情</div>
+              <div class="bigic" id="dIcon"></div>
+              <h3 id="dId">—</h3>
+              <div class="cls" id="dCls">—</div>
+              <div class="kv"><span>图标</span><span id="dIconName">—</span></div>
+              <div class="kv"><span>来源</span><span id="dSrc">—</span></div>
+              <div class="kv"><span>标记</span><span id="dTags">—</span></div>
+              <div class="kv"><span>显示</span><span id="dShow">—</span></div>
+              <div class="hintbox" id="dHint">点击左侧任意单位查看详情。</div>
+              <div class="acts">
+                <button class="btn sm" id="dBtnIcon" disabled>换图标…</button>
+                <button class="btn sm" id="dBtnHide" disabled>隐藏此单位</button>
+              </div>
+            </aside>
+          </div>
+        </section>
+      </div>
+
+      <!-- ============================ 运行环境 ============================ -->
+      <div class="page" id="page-env">
+        <div class="envsum" id="envSum">
+          <div class="ic" id="envSumIc">…</div>
+          <div>
+            <h3 id="envSumTitle">检测中…</h3>
+            <p id="envSumSub">正在读取本机环境</p>
+          </div>
+          <div class="right">
+            <button class="btn sm" id="btn-env">重新检测</button>
+            <button class="btn sm ghost" id="btn-env-copy">复制完整报告</button>
+          </div>
+        </div>
+        <div id="envGroups"></div>
+      </div>
+
+      <!-- ============================ 日志 ============================ -->
+      <div class="page" id="page-logs">
+        <section class="card" style="margin-top:0">
+          <div class="logbar">
+            <div class="seg" id="lvlSeg" role="tablist">
+              <button class="on" data-lvl="" role="tab">全部</button>
+              <button data-lvl="info" role="tab">信息</button>
+              <button data-lvl="warn" role="tab">警告</button>
+              <button data-lvl="err" role="tab">错误</button>
+            </div>
+            <input class="search" style="flex:0 1 240px" id="logSearch" placeholder="搜索日志…">
+            <span class="sp" style="flex:1"></span>
+            <button class="btn sm ghost" id="btnPauseFollow">暂停跟随</button>
+            <button class="btn sm ghost" id="btnLogCopy">复制全部</button>
+          </div>
+          <div class="logbox" id="logbox"></div>
+          <button class="lognew" id="logNew">新日志 ↓</button>
+          <div class="logfoot">
+            <span>缓冲上限 500 条</span>
+            <span style="margin-left:auto" id="logFootTxt">每 2 秒刷新 · 滚离底部自动暂停跟随</span>
+          </div>
+        </section>
+      </div>
+
+      <!-- ============================ 使用教程 ============================ -->
+      <div class="page" id="page-tutorial">
+        <section class="card" style="margin-top:0">
+          <header><h2>开对局前：游戏必须是窗口化</h2><span class="tag">必读</span></header>
+          <div class="body pad tut">
+            <p><b>只支持窗口化（Windowed Mode）或无边框窗口化（Borderless Windowed Mode）。</b>
+              覆盖层是一层独立的置顶窗口，靠外部跟随游戏窗口来对齐；游戏处于独占全屏时它贴不上去，
+              直播画面里 HUD 会浮在桌面上或整段错位。</p>
+            <p class="muted">设置位置：游戏主菜单 →「选项 / Options」→「Display」页，
+              勾选 <code>Windowed Mode</code>；想保留全屏观感再勾 <code>Borderless Windowed Mode</code>。
+              游戏内分辨率建议与 OBS 画布一致，覆盖层对位最省事。</p>
+            <div class="refwrap">
+              <span class="refzoom" data-img="/ui/img/windowed-mode.png" tabindex="0" role="button"
+                    aria-label="查看 Display 设置参考图大图">
+                <img src="/ui/img/windowed-mode.png"
+                     alt="MO 选项 Display 页，红框标出 Windowed Mode 与 Borderless Windowed Mode 两个勾选项">
+                <span class="refzoom-badge">悬停看大图</span>
+              </span>
+              <div class="refnote">
+                <p><b>参考图</b>：红框里这两项就是要勾的。只勾 <code>Windowed Mode</code> 会有标题栏和边框；
+                  同时勾 <code>Borderless Windowed Mode</code> 才是无边框的窗口化，覆盖层对位最省事。</p>
+                <p class="muted">鼠标停在上图会弹出原尺寸大图，移开即收起；点一下可以钉住，再点一次或按 Esc 关闭。</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <header><h2>五分钟跑起来</h2><span class="tag">从零到 OBS 出画面</span></header>
+          <div class="body pad tut">
+            <div class="tutstep">
+              <div class="n">1</div>
+              <div class="c">
+                <b>确认游戏目录</b>
+                <p>打开「环境」页，看顶部那条汇总是不是绿色。若提示找不到游戏，
+                  点「重新检测」；仍然失败就到「环境」里手动指定 <code>gamemd.exe</code> 所在目录。</p>
+              </div>
+            </div>
+            <div class="tutstep">
+              <div class="n">2</div>
+              <div class="c">
+                <b>进一局（先确认是窗口化）</b>
+                <p>游戏必须是<b>窗口化</b>或<b>无边框窗口化</b>，上一节有参考图。
+                  然后正常启动 MO，用观战槽进对局。<b>本程序不注入游戏、不改游戏文件</b>，
+                  只是只读地读内存和窗口状态，所以不需要额外装任何东西。</p>
+                <p class="muted">进对局后「总览」页的「对局」会变成绿色的「对局中」，说明数据通了。</p>
+              </div>
+            </div>
+            <div class="tutstep">
+              <div class="n">3</div>
+              <div class="c">
+                <b>让覆盖窗口贴住游戏</b>
+                <p>程序会自动找到游戏窗口并把覆盖层贴上去。切到别的软件时它会自动隐藏，
+                  回游戏自动恢复（可在「画面」页关掉这个行为）。</p>
+                <p class="muted">如果 HUD 没出现，先看「画面」页右边的状态胶囊：
+                  「未找到游戏」= 没识别到游戏窗口；「已隐藏」= 手动隐藏或失焦隐藏中。</p>
+              </div>
+            </div>
+            <div class="tutstep">
+              <div class="n">4</div>
+              <div class="c">
+                <b>接到 OBS</b>
+                <p>点右上角「复制 OBS 地址」，在 OBS 里添加「浏览器」源，把地址粘进去。
+                  尺寸设成和游戏分辨率一致（如 1920×1080），勾选「关闭源时关闭页面」。</p>
+                <p class="muted">OBS 源和本地覆盖窗口加载的是同一份数据，
+                  所以在「画面」页改的开关两端同时生效。</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <div class="grid2">
+          <div class="left">
+            <section class="card">
+              <header><h2>各页签做什么</h2></header>
+              <div class="body pad tut">
+                <div class="tutitem"><b>总览</b><p>四张状态卡（数据桥 / 对局 / 覆盖层 / 数据新鲜度）＋实时预览＋本局玩家表。先看这里判断链路通不通。</p></div>
+                <div class="tutitem"><b>画面</b><p>所有影响直播画面的开关：比分、单位栏、生产队列、Esc 菜单隐身、等待提示、顶栏布局，以及覆盖窗口和全局热键。</p></div>
+                <div class="tutitem"><b>单位</b><p>搜单位 ID，给任意单位换图标或隐藏；也能按形态 / 阵营 / 状态过滤。改动会同步到 OBS。</p></div>
+                <div class="tutitem"><b>环境</b><p>游戏路径、权限、分辨率、桥文件等自检项，出问题时先把这里的报告复制出来。</p></div>
+                <div class="tutitem"><b>日志</b><p>程序自己的运行日志，支持按级别过滤和搜索。反馈问题时贴这里的内容最有用。</p></div>
+              </div>
+            </section>
+
+            <section class="card">
+              <header><h2>常见问题</h2></header>
+              <div class="body pad tut">
+                <div class="tutitem"><b>HUD 一直显示「等待进入对局」</b>
+                  <p>说明数据桥还没读到对局。确认游戏真的进了地图（不是停在大厅），
+                    再看「总览」页「数据桥」卡是不是「托管运行中」。可以在「环境」页点「重启数据桥」。</p></div>
+                <div class="tutitem"><b>单位栏里出现没图标的方块</b>
+                  <p>该单位在原版美术里就没有 cameo（如焚风飞蜥炮台 DRACOD）。
+                    程序不会用别的图凑数以免误导，方块里会写单位 ID。</p></div>
+                <div class="tutitem"><b>覆盖层浮在桌面上 / 和游戏画面错位</b>
+                  <p>九成是全屏模式导致的。覆盖层是独立窗口，只能贴在窗口化的游戏上；
+                    到游戏「Options → Display」勾上 <code>Windowed Mode</code>（可再加
+                    <code>Borderless Windowed Mode</code>），见本页顶部的参考图。</p></div>
+                <div class="tutitem"><b>按 Esc 后队列没自动收起</b>
+                  <p>确认「画面」页的「Esc 菜单时隐藏队列」是开的。若仍然不收起，
+                    到「日志」页搜 <code>phase</code> 看状态，并把那条反馈出来。</p></div>
+                <div class="tutitem"><b>鼠标指针指示器什么时候出现</b>
+                  <p>默认只有指针压到 HUD 面板上才画（游戏画面内不出现）。
+                    想让它常亮，到「画面」页关掉「仅在遮挡时显示指针」。</p></div>
+              </div>
+            </section>
+          </div>
+
+          <div class="right">
+            <section class="card" style="margin-top:0">
+              <header><h2>三个窗口的关系</h2></header>
+              <div class="body pad tut">
+                <div class="tutitem"><b>控制台</b><p>就是本窗口。只改状态，不渲染 HUD。</p></div>
+                <div class="tutitem"><b>覆盖层</b><p>贴在游戏窗口上的透明窗口，加载 <code>/overlay</code>。只在这台机器上显示。</p></div>
+                <div class="tutitem"><b>OBS 浏览器源</b><p>加载同一个地址，所以控制台一改，两端同时生效。</p></div>
+                <div class="hintbox" style="margin-top:12px">
+                  只有「覆盖窗口」分区里的开关是<b>仅本地</b>生效的（置顶、失焦隐藏、显隐、热键），
+                  其余开关都会同步到 OBS 画面。<br>
+                  关掉覆盖窗口不影响直播：OBS 采集的是浏览器源，不是这个窗口。
+                </div>
+              </div>
+            </section>
+
+            <section class="card">
+              <header><h2>默认行为速查</h2></header>
+              <div class="body pad tut">
+                <table class="tuttable">
+                  <tr><td>比分 / 比赛名</td><td class="on">开</td></tr>
+                  <tr><td>单位栏</td><td class="on">开</td></tr>
+                  <tr><td>生产队列</td><td class="on">开</td></tr>
+                  <tr><td>Esc 菜单时隐藏队列</td><td class="on">开</td></tr>
+                  <tr><td>等待对局提示</td><td class="on">开</td></tr>
+                  <tr><td>观察者门槛</td><td class="off">关</td></tr>
+                  <tr><td>游戏失焦时自动隐藏</td><td class="on">开</td></tr>
+                  <tr><td>鼠标指针指示器</td><td class="on">开</td></tr>
+                  <tr><td>仅在遮挡时显示指针</td><td class="on">开</td></tr>
+                  <tr><td>全局热键</td><td class="off">关</td></tr>
+                </table>
+              </div>
+            </section>
+
+            <section class="card">
+              <header><h2>操作边界</h2></header>
+              <div class="body pad tut">
+                <p>本程序对游戏<b>只读</b>：只做 <code>OpenProcess(VM_READ)</code> 和窗口状态查询，
+                  不注入 DLL、不打补丁、不改内存、不模拟按键。</p>
+                <p class="muted">因此它不会影响对局公平性，也不会被反作弊误判；
+                  代价是看不到游戏没有暴露给你的信息。</p>
+              </div>
+            </section>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============================ 帮助 ============================ -->
+      <div class="page" id="page-help">
+        <section class="card" style="margin-top:0">
+          <header><h2>三个窗口的关系</h2></header>
+          <div class="body pad" style="font-size:12.5px;color:var(--sub);line-height:1.85">
+            <p style="margin:0 0 10px"><b style="color:var(--txt)">控制台</b>（本窗口）只负责改状态，不渲染 HUD。</p>
+            <p style="margin:0 0 10px"><b style="color:var(--txt)">覆盖层</b>是贴在游戏窗口上的透明窗口，加载 <code style="font-family:Consolas,monospace;color:var(--acc)">/overlay</code>。</p>
+            <p style="margin:0"><b style="color:var(--txt)">OBS 浏览器源</b>加载同一个地址，所以控制台一改，两端同时生效。</p>
+            <div class="hintbox" style="margin-top:14px">
+              只有「覆盖窗口」分区里的开关是仅本地生效的（置顶、失焦隐藏、显隐、热键），
+              其余开关都会同步到 OBS 画面。
+            </div>
+          </div>
+        </section>
+        <section class="card">
+          <header><h2>状态与提示对照</h2></header>
+          <div class="body pad" id="helpStates" style="font-size:12px;color:var(--sub);line-height:2"></div>
+        </section>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- 换图标弹窗 -->
+<div class="modal" id="pickmodal" hidden>
+  <div class="box">
+    <div class="row" style="margin-top:0">
+      <b id="pick-title" style="font-family:Consolas,monospace"></b>
+      <input type="text" id="pick-search" placeholder="过滤图库 ID…" style="width:170px">
+      <span style="flex:1"></span>
+      <button class="btn sm ghost" id="pick-close">关闭</button>
+    </div>
+    <div class="row">
+      <input type="text" id="pick-custom" placeholder="或直接填 custom/文件名.png / byid 文件名" style="flex:1">
+      <button class="btn sm primary" id="pick-apply">应用</button>
+    </div>
+    <div class="gallery" id="pick-gallery"></div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="/icons-live.js"></script>
+<script src="/ui/control.js"></script>
+<script src="/ui/pages/overview.js"></script>
+<script src="/ui/pages/display.js"></script>
+<script src="/ui/pages/units.js"></script>
+<script src="/ui/pages/env.js"></script>
+<script src="/ui/pages/logs.js"></script>
+</body>
+</html>

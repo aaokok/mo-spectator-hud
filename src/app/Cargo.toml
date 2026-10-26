@@ -1,0 +1,37 @@
+[package]
+name = "mo_hud"
+version = "0.1.0"
+edition = "2021"
+description = "MO 观战 HUD 应用外壳（Tauri 2）：内嵌服务 + 桥托管 + 覆盖窗口 + 控制台"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-clipboard-manager = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = "0.8"
+tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread", "sync", "fs"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+form_urlencoded = "1"
+
+winreg = "0.55"
+win32job = "2"
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_HiDpi",
+  "Win32_System_Threading",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_Graphics_Gdi",
+] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
