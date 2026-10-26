@@ -6,6 +6,24 @@
 
 ---
 
+## 🛠️ 编译发布版
+
+1. **编译数据桥 (`hud_bridge.exe`)**：
+   - 进入 `src/bridge/` 目录运行批处理：
+     ```cmd
+     build_bridge.bat
+     ```
+   - 编译产物位于 `src/bridge/hud_bridge.exe`。
+
+2. **编译客户端正式版 (`mo_hud.exe`)**：
+   - 进入 `src/app/` 目录执行 Release 构建：
+     ```cmd
+     cargo build --release
+     ```
+   - 编译产物位于 `src/app/target/release/mo_hud.exe`。
+
+---
+
 ## 📦 本地便携包组装规范
 
 ```text
