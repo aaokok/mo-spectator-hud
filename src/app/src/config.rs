@@ -31,20 +31,16 @@ impl Paths {
             .unwrap_or_else(|| PathBuf::from("."));
         let exe_dir = dunce_canonical(&exe_dir);
 
-        // 发布布局
-        if exe_dir.join("hud/control.html").is_file() && exe_dir.join("demo/index.html").is_file() {
-            return Paths {
-                demo_root: exe_dir.join("demo"),
-                toolkit_dir: exe_dir.clone(),
-                app_root: exe_dir.join("hud"),
-                ini: exe_dir.join("mo_hud.ini"),
-                exe_dir,
-            };
-        }
-
-        // 开发布局：向上找含 前端开发/Demo 或 src/overlay 的祖先目录
+        // 开发布局优先：向上找同时含前端与控制台页面的祖先目录。
+        // 必须排在发布布局判定之前 —— cargo build 会把 hud/ 与 demo/ 拷进
+        // target/{debug,release}/，使 exe 同级同时满足发布布局条件；若先判发布布局，
+        // 跑 debug exe 时读到的就是构建那一刻的副本，之后对源码的修改（新增页面、
+        // 路由表等）全部不生效，表现为"点新页面立刻弹回总览"这类假故障。
         for anc in exe_dir.ancestors() {
-            if anc.join("src/overlay/index.html").is_file() {
+            // 开源仓库标准布局：src/overlay/index.html + src/console/control.html
+            if anc.join("src/overlay/index.html").is_file()
+                && anc.join("src/console/control.html").is_file()
+            {
                 let toolkit = if anc.join("release/hud_bridge.exe").is_file() {
                     anc.join("release")
                 } else {
@@ -59,7 +55,10 @@ impl Paths {
                 };
             }
 
-            if anc.join("前端开发/Demo/index.html").is_file() {
+            // 本地开发测试布局：前端开发/Demo/index.html + 前端开发/exe_New/hud/control.html
+            if anc.join("前端开发/Demo/index.html").is_file()
+                && anc.join("前端开发/exe_New/hud/control.html").is_file()
+            {
                 let fe = anc.join("前端开发");
                 return Paths {
                     demo_root: fe.join("Demo"),
@@ -70,6 +69,17 @@ impl Paths {
                     exe_dir,
                 };
             }
+        }
+
+        // 发布布局：exe 同级自带 hud/ + demo/（NSIS 安装后的形态）
+        if exe_dir.join("hud/control.html").is_file() && exe_dir.join("demo/index.html").is_file() {
+            return Paths {
+                demo_root: exe_dir.join("demo"),
+                toolkit_dir: exe_dir.clone(),
+                app_root: exe_dir.join("hud"),
+                ini: exe_dir.join("mo_hud.ini"),
+                exe_dir,
+            };
         }
 
         // 兜底：全部按 exe 同级
@@ -149,6 +159,16 @@ pub struct CtrlState {
     /// R22：Esc / 选项菜单打开时自动隐藏生产队列列。默认开。
     /// 判据是桥的 menu_open（多人局 IsGamePaused 不置位，原来的 paused 判据从不触发）。
     pub hide_queue_on_menu: bool,
+    /// R29：支援技能栏（F 方案）。默认关 —— 不开则渲染端维持原状。
+    /// 只在 1v1 生效：开启后 1v1 的玩家面板也走两列（原本是单列窄栏），
+    /// 给支援技能格腾出横向空间；非 1v1 不受影响。
+    pub show_supers: bool,
+    /// R29：支援技能优先显示顺序，JSON 数组，元素是超武节名。
+    /// 数组内的按顺序排在前；不在数组里的按桥输出原序排在后面。
+    pub super_priority: String,
+    /// R29：不显示的支援技能，JSON 字符串数组（超武节名）。
+    /// 与 hidden_units 完全分离 —— 单位是 unit_types 的 ID，这里是 SuperWeapon 节名。
+    pub hidden_supers: String,
 }
 
 impl Default for CtrlState {
@@ -173,6 +193,9 @@ impl Default for CtrlState {
             unit_priority: String::from("[\"hero\",\"one\",\"cnt\"]"),
             show_wait_hint: true,
             hide_queue_on_menu: true,
+            show_supers: false,
+            super_priority: String::new(),
+            hidden_supers: String::new(),
         }
     }
 }
@@ -225,6 +248,15 @@ impl CtrlState {
                 }
                 st.show_wait_hint = v["show_wait_hint"].as_bool().unwrap_or(st.show_wait_hint);
                 st.hide_queue_on_menu = v["hide_queue_on_menu"].as_bool().unwrap_or(st.hide_queue_on_menu);
+                st.show_supers = v["show_supers"].as_bool().unwrap_or(st.show_supers);
+                for (key, dst) in [
+                    ("super_priority", &mut st.super_priority),
+                    ("hidden_supers", &mut st.hidden_supers),
+                ] {
+                    if let Some(s) = v[key].as_str() {
+                        *dst = s.to_string();
+                    }
+                }
             }
         }
         st
@@ -261,6 +293,18 @@ pub fn valid_priority_json(v: &str) -> bool {
         }
         _ => false,
     })
+}
+
+/// super_priority / hidden_supers 合法性：JSON 数组，元素全是字符串。
+/// 不限定具体枚举 —— 超武节名由 MO 的 ini 决定，写死白名单会和地图内嵌 ini 脱节。
+pub fn valid_string_array_json(v: &str) -> bool {
+    if v.trim().is_empty() {
+        return true;
+    }
+    match serde_json::from_str::<serde_json::Value>(v) {
+        Ok(serde_json::Value::Array(arr)) => arr.iter().all(|x| x.is_string()),
+        _ => false,
+    }
 }
 
 /// mo_hud.ini（游戏目录、扫描频率、覆盖层开关、热键的持久化）
@@ -449,18 +493,49 @@ impl AppState {
     }
 
     pub fn log(&self, msg: impl AsRef<str>) {
-        let mut q = self.log.lock().unwrap();
-        let ts = chrono_now();
-        q.push_back(format!("[{ts}] {}", msg.as_ref()));
-        while q.len() > 500 {
-            q.pop_front();
+        let msg = msg.as_ref();
+        let line = format!("[{}] {msg}", chrono_now());
+        {
+            let mut q = self.log.lock().unwrap_or_else(|e| e.into_inner());
+            q.push_back(line.clone());
+            while q.len() > 500 {
+                q.pop_front();
+            }
         }
-        println!("[{ts}] {}", msg.as_ref());
+        append_log_file(&self.paths.app_root, &line);
+        println!("{line}");
+    }
+}
+
+/// 运行日志落盘。控制台「日志」页只留 500 行，程序一关现场就没了，
+/// 用户反馈问题时无从查起。超过 2 MB 轮转一次（旧文件覆盖为 .1），
+/// 一次完整对局的量远小于此，不会丢现场。
+fn append_log_file(dir: &Path, line: &str) {
+    append_capped(dir, "_mo_hud.log", line);
+}
+
+/// 追加一行到 `dir/name`；文件超过 2 MB 时先轮转为 `<name>.1`。
+/// 日志类文件都必须走这里——异常/崩溃可能每帧触发，无上限会写满磁盘。
+pub fn append_capped(dir: &Path, name: &str, line: &str) {
+    use std::io::Write;
+    let p = dir.join(name);
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(m) = std::fs::metadata(&p) {
+        if m.len() > 2 * 1024 * 1024 {
+            let _ = std::fs::rename(&p, dir.join(format!("{name}.1")));
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+    {
+        let _ = writeln!(f, "{line}");
     }
 }
 
 /// 本地时间戳 HH:MM:SS（不引 chrono，省编译）
-fn chrono_now() -> String {
+pub(crate) fn chrono_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

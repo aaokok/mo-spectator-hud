@@ -51,13 +51,19 @@ pub fn restart_with_interval(state: &std::sync::Arc<AppState>, interval: u32) {
 }
 
 fn kill_ours(state: &std::sync::Arc<AppState>) {
-    let mut slot = child_slot().lock().unwrap();
-    if let Some(child) = slot.as_mut() {
-        let _ = child.kill();
-        let _ = child.wait();
-        state.log("已终止托管的数据桥");
+    {
+        let mut slot = child_slot().lock().unwrap();
+        if let Some(child) = slot.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+            state.log("已终止托管的数据桥");
+        }
+        *slot = None;
     }
-    *slot = None;
+    // 托管实例已不存在：ours/running 同步落回 false，否则控制台会一直显示"托管运行中/Job 陪葬"
+    let mut b = state.bridge.lock().unwrap();
+    b.running = false;
+    b.ours = false;
 }
 
 fn spawn_bridge(state: &std::sync::Arc<AppState>, interval: u32) {
@@ -89,6 +95,7 @@ fn spawn_bridge(state: &std::sync::Arc<AppState>, interval: u32) {
     match cmd.spawn() {
         Ok(mut child) => {
             // Job 陪葬：句柄故意常驻（本进程退出时 OS 关闭 job → 桥被终结）
+            let mut in_job = false;
             if let Ok(job) = Job::create() {
                 let mut info = ExtendedLimitInfo::new();
                 info.limit_kill_on_job_close();
@@ -96,10 +103,12 @@ fn spawn_bridge(state: &std::sync::Arc<AppState>, interval: u32) {
                     && job.assign_process(child.as_raw_handle() as _).is_ok()
                 {
                     *job_slot().lock().unwrap() = Some(job);
+                    in_job = true;
                     state.log("数据桥已挂入 Job 对象（KILL_ON_JOB_CLOSE）");
                 }
             }
-            // stdout 回捕进日志
+            // stdout/stderr 回捕进日志。stderr 必须一并读走：管道写满（约 4KB）后
+            // 子进程会阻塞在写调用上，表现为桥"活着但不再出数"。
             if let Some(out) = child.stdout.take() {
                 let st = state.clone();
                 std::thread::spawn(move || {
@@ -112,7 +121,25 @@ fn spawn_bridge(state: &std::sync::Arc<AppState>, interval: u32) {
                     }
                 });
             }
-            state.bridge.lock().unwrap().running = true;
+            if let Some(err) = child.stderr.take() {
+                let st = state.clone();
+                std::thread::spawn(move || {
+                    use std::io::{BufRead, BufReader};
+                    let reader = BufReader::new(err);
+                    for line in reader.lines().map_while(Result::ok) {
+                        if !line.trim().is_empty() {
+                            st.log(format!("[bridge:err] {line}"));
+                        }
+                    }
+                });
+            }
+            {
+                // ours 的语义是"在 Job 里"，不是"我起的"——挂 Job 失败时如实报未挂
+                let mut b = state.bridge.lock().unwrap();
+                b.running = true;
+                b.ours = in_job;
+                b.external = false;
+            }
             state
                 .log(format!("数据桥已启动（interval={interval}ms, pid={:?}）", child.id()));
             *child_slot().lock().unwrap() = Some(child);
@@ -146,7 +173,13 @@ fn watch_loop(state: std::sync::Arc<AppState>) {
         if exited {
             *slot = None;
             drop(slot);
-            state.bridge.lock().unwrap().restarts += 1;
+            {
+                // 退避/重启期间桥已不在：状态必须同步落回，否则控制台显示与实际相反
+                let mut b = state.bridge.lock().unwrap();
+                b.running = false;
+                b.ours = false;
+                b.restarts += 1;
+            }
             std::thread::sleep(Duration::from_millis(
                 BACKOFF_MS[attempt.min(BACKOFF_MS.len() - 1)],
             ));

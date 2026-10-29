@@ -199,19 +199,39 @@
 </footer>
 
 <script>
-/* 调试信标（仅 ?probe=1 时启用）：脚本异常回传，无头浏览器没有 console 可用 */
-if (/[?&]probe=1/.test(location.search)) {
-  window.addEventListener('error', function (e) {
+/* 页面异常回传：OBS 浏览器源没有控制台，渲染端出错原本完全静默。
+   常开 + 去重 + 上限 20 条：渲染循环里同一个错误每帧都会抛，
+   不设上限会把运行日志和 _probe_error.log 刷爆。 */
+(function () {
+  var seen = {}, sent = 0, MAX = 20;
+  function report(kind, payload) {
+    if (sent >= MAX) return;
+    var key = kind + '|' + payload.msg;
+    if (seen[key]) { seen[key]++; return; }
+    seen[key] = 1;
+    sent++;
+    payload.kind = kind;
+    payload.page = 'overlay';
+    payload.url = location.href;
     try {
       fetch('/probe-error', {
         method: 'POST',
-        body: JSON.stringify({ msg: String(e.message), src: e.filename, line: e.lineno, col: e.colno })
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
       });
-    } catch (err) {}
+    } catch (e) {}
+  }
+  window.addEventListener('error', function (e) {
+    report('error', { msg: String(e.message), src: e.filename, line: e.lineno, col: e.colno });
   });
-}
+  window.addEventListener('unhandledrejection', function (e) {
+    var r = e.reason;
+    report('rejection', { msg: String(r && r.stack ? r.stack : r) });
+  });
+})();
 </script>
 <script src="assets/icons/alt-manifest.js"></script>
+<script src="assets/sw-cond.js"></script>
 <script src="icons-live.js"></script>
 <script src="heroes.js"></script>
 <script src="live-data.js"></script>

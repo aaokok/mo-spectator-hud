@@ -149,6 +149,7 @@ const TITLES = {
   overview: '总览',
   display: '直播画面',
   units: '单位与图标',
+  supers: '支援技能',
   env: '运行环境',
   logs: '运行日志',
   tutorial: '使用教程',

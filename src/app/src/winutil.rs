@@ -224,17 +224,102 @@ pub fn primary_monitor_size() -> Option<(u32, u32)> {
 /// 读 PE 头 TimeDateStamp（桥 preflight 同款口径：YR 1.001 = 0x3BDF544E）
 pub fn pe_timestamp(exe: &std::path::Path) -> Option<u32> {
     let data = std::fs::read(exe).ok()?;
+    pe_timestamp_from(&data)
+}
+
+/// 从字节流解析 TimeDateStamp，便于单测。
+/// 布局：e_lfanew(0x3C) → Signature(4) → Machine(2) → NumberOfSections(2) → TimeDateStamp(4)。
+/// 即 TimeDateStamp 在 `lfanew + 8`，不是 `lfanew + 4`（那里是 Machine|NumberOfSections<<16）。
+pub fn pe_timestamp_from(data: &[u8]) -> Option<u32> {
     if data.len() < 0x40 {
         return None;
     }
     let lfanew = u32::from_le_bytes([data[0x3c], data[0x3d], data[0x3e], data[0x3f]]) as usize;
-    if lfanew + 8 > data.len() {
+    // 头部偏移本身必须落在 DOS stub 之后，且 12 字节 NT 头可读
+    if lfanew < 0x40 || lfanew + 12 > data.len() {
         return None;
     }
+    let sig = u32::from_le_bytes([
+        data[lfanew],
+        data[lfanew + 1],
+        data[lfanew + 2],
+        data[lfanew + 3],
+    ]);
+    if sig != 0x0000_4550 {
+        return None; // 非 PE，避免把随机字节当时间戳
+    }
     Some(u32::from_le_bytes([
-        data[lfanew + 4],
-        data[lfanew + 5],
-        data[lfanew + 6],
-        data[lfanew + 7],
+        data[lfanew + 8],
+        data[lfanew + 9],
+        data[lfanew + 10],
+        data[lfanew + 11],
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pe_timestamp_from;
+
+    /// 构造最小 PE 头：DOS 头 + 指定 NT 头字段
+    fn synth_pe(lfanew: usize, machine: u16, nsec: u16, tds: u32) -> Vec<u8> {
+        let mut d = vec![0u8; lfanew + 0x40];
+        d[0] = b'M';
+        d[1] = b'Z';
+        d[0x3c..0x40].copy_from_slice(&(lfanew as u32).to_le_bytes());
+        d[lfanew..lfanew + 4].copy_from_slice(&0x0000_4550u32.to_le_bytes());
+        d[lfanew + 4..lfanew + 6].copy_from_slice(&machine.to_le_bytes());
+        d[lfanew + 6..lfanew + 8].copy_from_slice(&nsec.to_le_bytes());
+        d[lfanew + 8..lfanew + 12].copy_from_slice(&tds.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn reads_timestamp_at_lfanew_plus_8() {
+        let d = synth_pe(0x108, 0x014C, 4, 0x3BDF_544E);
+        assert_eq!(pe_timestamp_from(&d), Some(0x3BDF_544E));
+        // 旧实现在 +4 读到的 0x014C | (4 << 16)，确认不会被误判为时间戳
+        assert_ne!(pe_timestamp_from(&d), Some(0x0004_014C));
+    }
+
+    #[test]
+    fn rejects_short_and_non_pe() {
+        assert_eq!(pe_timestamp_from(&[0u8; 16]), None);
+        let mut d = synth_pe(0x108, 0x014C, 4, 0x3BDF_544E);
+        d[0x108] = 0; // 破坏 PE\0\0 签名
+        assert_eq!(pe_timestamp_from(&d), None);
+        // e_lfanew 落在 DOS 头内部
+        let mut bad = synth_pe(0x108, 0x014C, 4, 0x3BDF_544E);
+        bad[0x3c..0x40].copy_from_slice(&0x20u32.to_le_bytes());
+        assert_eq!(pe_timestamp_from(&bad), None);
+    }
+
+    /// 真实文件口径：本机若存在 YR 1.001 的 gamemd.exe，必须解析出 0x3BDF544E。
+    /// 路径不存在时跳过（CI/其他机器上不该因此失败）。
+    #[test]
+    fn real_gamemd_matches_yr1001() {
+        let mut roots = vec![
+            std::path::PathBuf::from(r"C:\Users\Admin\Desktop\Zcode\CTF\MentalOmega336"),
+            std::path::PathBuf::from(r"C:\Users\Admin\Desktop\Zcode\CTF\RA2YR-1.001\YurisRevenge"),
+        ];
+        if let Ok(d) = std::env::var("MO_GAME_DIR") {
+            roots.insert(0, std::path::PathBuf::from(d));
+        }
+        let mut checked = 0;
+        for root in roots {
+            let exe = root.join("gamemd.exe");
+            if !exe.is_file() {
+                continue;
+            }
+            assert_eq!(
+                super::pe_timestamp(&exe),
+                Some(0x3BDF_544E),
+                "{} 的 TimeDateStamp 不是 YR 1.001",
+                exe.display()
+            );
+            checked += 1;
+        }
+        if checked == 0 {
+            eprintln!("跳过：本机没有可用的 gamemd.exe");
+        }
+    }
 }

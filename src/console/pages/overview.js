@@ -168,7 +168,7 @@ function renderStats(st) {
   $('sbMeta').innerHTML = b.external
     ? '<span>不由本程序回收</span><span>频率切换不生效</span>'
     : `<span>重启 <em>${b.restarts}</em> 次</span><span>${b.ours ? 'Job 陪葬' : '未挂 Job'}</span>`;
-  $('sbFoot').innerHTML = '<span>hud_bridge.exe</span><span>v6.8</span>';
+  $('sbFoot').innerHTML = '<span>hud_bridge.exe</span><span>v7.0</span>';
   $('sbBar').style.width = b.running ? '100%' : '8%';
 
   /* 游戏 */

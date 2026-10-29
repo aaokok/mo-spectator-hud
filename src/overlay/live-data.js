@@ -114,6 +114,34 @@
     return out;
   }
 
+  /* 支援技能（v7.2 桥的 supers[]）。
+     drain: ChargeDrainState —— 0=充能中 1=就绪 2=运作中（火风暴/电池类）。
+     运作中时 pct 是"剩余运作时间"，从 100 往下走，不是充能进度；
+     drain_total 是那次的维持时长（帧），仅用于倒计时秒数换算。
+     hidden: SW.ShowCameo=false（AI/剧情用），玩家侧栏本就不显示，默认不画。
+     manual 是**类型级**的「需玩家手动起充」标志（Type+0xF5），
+     不是"某个玩家能不能发射"，渲染端不要拿它过滤。 */
+  function toSupers(arr) {
+    if (!Array.isArray(arr)) return [];
+    return arr.map(function (s) {
+      if (!s || !s.id) return null;
+      var drain = (typeof s.drain === 'number') ? s.drain : -1;
+      return {
+        id: s.id,
+        pct: Math.max(0, Math.min(100, Number(s.pct) || 0)),
+        ready: !!s.ready,
+        suspended: !!s.suspended,
+        total: Number(s.total) || 0,
+        left: Number(s.left) || 0,
+        drain: drain,
+        draining: drain === 2,
+        drainTotal: Number(s.drain_total) || 0,
+        manual: s.manual !== false,
+        hidden: !!s.hidden
+      };
+    }).filter(Boolean);
+  }
+
   function toPlayer(p, slot) {
     var units = (p.unit_types || []).map(function (u) {
       return {
@@ -153,6 +181,8 @@
       /* v6.6 起桥会输出 queues；没有该字段（老桥或读取失败）时为 null，
          渲染端据此区分"未接入"与"该通道空闲"。 */
       queues: toQueues(p.queues),
+      /* v7.2 起桥会输出 supers[]；老桥没有该键 → 空数组，渲染端画"未接入"。 */
+      supers: toSupers(p.supers),
       slot: p.slot,
       _slot: slot
     };

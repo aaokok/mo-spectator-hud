@@ -747,11 +747,20 @@ body.paused .paused-badge { display: inline-block; }
   display: flex;
   flex-direction: column;
   gap: 8px;
-  /* 侧栏只用到可用高度的 65%：再往下会压住战场/其他 UI，
-     超出部分由 JS 的 railMaxUnits() 折算成 +N 尾格，不在这里滚动。 */
+  /* 侧栏高度由 JS 的 applyLayout 写入（可用高度 × 65%，且不超过游戏画面高的 70%）。
+     必须 min-height:0，否则 flex 容器会被子卡片按内容撑破 —— height 只是下限，
+     clientHeight 会长到内容高，railMaxUnits()/railMaxSupers() 读到的预算就失真，
+     卡片会溢出侧栏压住战场（实测 1080p 下 542px 被撑到 603px）。
+     超出部分由 JS 折算成 +N 尾格，不在这里滚动。 */
+  min-height: 0;
   overflow: hidden;
   overscroll-behavior: contain;
   scrollbar-width: none;
+}
+
+.rail > .rp {
+  /* 卡片同理：不参与 flex 拉伸，高度完全由内容决定，超出由 .rail 裁掉 */
+  flex: 0 0 auto;
 }
 
 .rail::-webkit-scrollbar { display: none; }
@@ -918,14 +927,226 @@ body.paused .paused-badge { display: inline-block; }
   background: rgba(18, 24, 32, .86);
 }
 
-.ucell.noicon .uid,
-.qitem.noicon .uid {
+.ucell.noicon .uid {
   padding: 0 3px;
   color: #b8c5d4;
   font: 700 9px/1.15 Consolas, monospace;
   letter-spacing: -.02em;
   text-align: center;
   word-break: break-all;
+}
+
+/* 队列的 ID 文字：格子缩小时跟着缩（单位格不变，它是固定 60×48） */
+.qitem.noicon .uid {
+  padding: 0 3px;
+  color: #b8c5d4;
+  font: 700 var(--qc-uid-fs, 9px)/1.15 Consolas, monospace;
+  letter-spacing: -.02em;
+  text-align: center;
+  word-break: break-all;
+}
+
+/* ---------------------------------------------------------------- 支援技能区
+   接在 .rp-grid 单位格下方，同一套 60×48 格子语言，玩家归属天然正确。
+   SidebarPCX 图标底部印着游戏自带的中文技能名 —— 实测 96 张图标里名字像素
+   只落在 y=39..43、底板顶线 y=38，所以底部一条 10px 带子就能罩住名字，
+   多一像素都是白扔图标面积。
+   分层：左上=金钱角标($) / 右上=电力角标(⚡)，图形与顶栏玩家信息同款
+        底部 10px=充能条，宽度=进度，不写文字（半透明，名字仍可辨认）
+   R33 去掉了顶部"就绪"徽标：就绪态已有全彩图标 + 绿框 + 绿光三重提示，
+   再加一行 7px 小字只会压住图标主体。 */
+.sw-sec {
+  display: grid;
+  gap: 4px;
+  justify-content: center;
+  /* 与单位格之间的分隔线：单位格和技能格同为 60×48，不留一条明确的界线
+     两列扫一眼容易把技能当成某个单位。线本身要够亮才看得出（10% 白实测
+     在暗面板上几乎不可见），同时左右各留 2px 不顶满，视觉上更像分隔而非边框。
+     总高度 13px（6 margin + 6 padding + 1 border）与 JS 的 SW_SEP_H 严格一致，
+     差一像素就会让行配额算错。 */
+  margin: 6px 2px 0;
+  padding-top: 6px;
+  border-top: 1px solid rgba(255, 255, 255, .28);
+}
+
+.sw {
+  position: relative;
+  width: 60px;
+  height: 48px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, .16);
+  border-radius: 3px;
+  background: rgba(3, 5, 8, .55);
+  /* 底部 10px 带子的两个透明度旋钮（R33）：
+     --swcov-a 底板只压暗不封死，进度条 --swbar-a 叠上去后，
+     区间内图标自带的中文技能名仍隐约可辨 —— 不必再靠一条实色带硬遮。
+     取值依据：底板 .45 + 进度条 .58 叠加后残留可见度约 25%，
+     名字在 1080p 下仍能读出字形轮廓，同时进度条边缘依然清晰。 */
+  --swcov-a: .45;
+  --swbar-a: .58;
+}
+
+/* 超出上限的技能收成 +N，与 .ucell.more 同一视觉语言 */
+.sw.more {
+  display: grid;
+  place-items: center;
+  color: #9fb0c2;
+  font: 700 11px Consolas, monospace;
+  background: rgba(255, 255, 255, .05);
+}
+
+/* 绝对定位而不是普通流：.sw-sec 是 grid，普通流里的 img 会被
+   grid 的 auto 轨道压成 42×33（实测），固定尺寸才和其他格子对齐 */
+.sw img {
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: block;
+  width: 60px;
+  height: 48px;
+  image-rendering: pixelated;
+  opacity: .82;
+}
+
+/* 彩色只属于"现在就能按"：充能中、充满但条件不满足、暂停充能一律转灰。
+   灰度档位（R33 用户反馈"太暗"）：原来 charging .60 / susp .44 两级，
+   在暗面板上几乎看不出图标内容。现在整体提亮一档到 .80 / .66，
+   配合 opacity .88，靠**色相消失**而不是**亮度压死**来表达"还不能用"。 */
+.sw.charging img,
+.sw.nocond img { filter: grayscale(1) brightness(.80) contrast(.94); opacity: .88; }
+.sw.susp img { filter: grayscale(1) brightness(.66) contrast(.94); opacity: .82; }
+
+/* 底部充能条：10px 高，半透明叠在图标自带的中文技能名上（R33 用户要求）。
+   cov 是恒定底板，始终盖住整条 60px；fill 从左生长，宽度=充能进度。
+   两者都是半透明，所以进度条扫过的区间里名字会透出来 —— 视觉上能同时读到
+   "条走到哪"和"这是哪个技能"，不再需要几近不透明的实色带。
+   透明度旋钮在 .sw 上的 --swcov-a / --swbar-a，调档不用碰规则本身。 */
+.sw .cov {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 10px;
+  background: rgba(4, 6, 10, var(--swcov-a, .45));
+}
+.sw .fill {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 10px;
+  background: linear-gradient(90deg, rgba(27, 92, 131, var(--swbar-a, .58)),
+                                     rgba(47, 154, 216, var(--swbar-a, .58)));
+}
+
+/* 条件角标：字色/描边/告警底逐字取自顶栏 .pbox.over（电力超额告警），
+   让观众一眼把"技能不能按"和顶栏的红色告警联系起来。
+   ⚡ 必须带 U+FE0E：Edge 下不带变体选择符会渲染成彩色 emoji，color 完全失效
+   （实测像素恒为 250,120,70），加 FE0E 才能继承 currentColor 变红。 */
+.sw .cond {
+  position: absolute;
+  top: 1px;
+  width: 13px;
+  height: 13px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 92, 84, .85);
+  background: rgba(190, 32, 26, .58);
+  box-shadow: 0 0 8px rgba(255, 82, 74, .35), 0 1px 2px rgba(0, 0, 0, .7);
+  font: 700 8px/1 Consolas, monospace;
+  pointer-events: none;
+}
+.sw .cond.money { left: 1px; color: #ffc9c4; }
+.sw .cond.power { right: 1px; color: #ffb4ad; }
+.sw .cond.off { display: flex; }
+
+/* 就绪：绿框 + 绿光 + 全彩图标，条子转绿。
+   不再有顶部"就绪"文字徽标 —— 三重绿提示已经足够，文字只会压住图标。 */
+.sw.ready {
+  border-color: rgba(120, 255, 150, .9);
+  box-shadow: 0 0 0 1px rgba(120, 255, 150, .35), 0 0 13px rgba(90, 240, 140, .5);
+}
+.sw.ready img { opacity: 1; }
+.sw.ready .fill {
+  background: linear-gradient(90deg, rgba(46, 156, 82, var(--swbar-a, .58)),
+                                     rgba(127, 240, 154, var(--swbar-a, .58)));
+}
+
+/* 充能满但条件不满足（缺钱/断电）：不给绿框，否则等于骗人说能按。
+   琥珀描边 + 琥珀条，一眼区分"充满"和"真能打"。 */
+.sw.nocond {
+  border-color: rgba(255, 190, 90, .75);
+  box-shadow: 0 0 0 1px rgba(255, 180, 80, .22);
+}
+.sw.nocond .fill {
+  background: linear-gradient(90deg, rgba(107, 74, 18, var(--swbar-a, .58)),
+                                     rgba(184, 134, 42, var(--swbar-a, .58)));
+}
+
+/* 暂停（断电/EMP/手动）：进度真的停住，压得更暗 */
+.sw.susp .fill {
+  background: linear-gradient(90deg, rgba(74, 58, 16, var(--swbar-a, .58)),
+                                     rgba(122, 100, 32, var(--swbar-a, .58)));
+}
+
+/* 一次性：只剩一次使用次数，标在右上角标下方（底部已让给充能条） */
+.sw .tag1 {
+  position: absolute;
+  right: 1px;
+  top: 16px;
+  display: none;
+  padding: 0 2px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, .78);
+  color: #ffe9a8;
+  font: 700 8px/9px Consolas, monospace;
+  text-shadow: 0 1px 1px #000;
+  pointer-events: none;
+}
+.sw.once .tag1 { display: block; }
+
+/* 运行中（火风暴/电池类的 drain 态）：青色脉动，和"倒计时充能"区分开。
+   这类 IsReady 恒为 1，若按 ready 画会永远是绿的满格 —— 观众看不到它在消耗。
+   R33 后只有这一种状态还带文字徽标："就绪"已删除（绿框+绿光已足够），
+   但 drain 的条是 100→0 倒着走，没有文字容易和"正在攒"看混。 */
+.sw.run {
+  border-color: rgba(120, 220, 255, .85);
+  box-shadow: 0 0 0 1px rgba(120, 210, 255, .3), 0 0 10px rgba(90, 200, 255, .45);
+  animation: swrun 1.6s ease-in-out infinite;
+}
+
+/* 运行徽标：顶部正中，9px 高 / 7px 字。只有 .sw.run 的格子会渲染这个节点 */
+.sw .rdy {
+  position: absolute;
+  top: 1px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 9px;
+  padding: 0 3px;
+  border-radius: 1px;
+  white-space: nowrap;
+  background: rgba(4, 20, 27, .55);
+  border: 1px solid rgba(120, 220, 255, .55);
+  color: #b8ecff;
+  font: 700 7px/1 Consolas, monospace;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, .9);
+  pointer-events: none;
+}
+.sw.run img { filter: none; opacity: 1; }
+.sw.run .fill {
+  background: linear-gradient(90deg, rgba(29, 127, 168, var(--swbar-a, .58)),
+                                     rgba(143, 233, 255, var(--swbar-a, .58)));
+}
+@keyframes swrun {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(120, 210, 255, .3), 0 0 10px rgba(90, 200, 255, .45); }
+  50% { box-shadow: 0 0 0 1px rgba(120, 210, 255, .55), 0 0 16px rgba(90, 200, 255, .75); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sw.run { animation: none; }
 }
 
 /* ---------------------------------------------------------------- production queue */
@@ -1038,18 +1259,22 @@ body.paused .paused-badge { display: inline-block; }
   white-space: nowrap;
 }
 
+/* 格子几何全部走 CSS 变量（由 demo.js 的 applyQueueGeometry 写入）：
+   侧栏窄的时候整体缩小图标，而不是减列。
+   --qc-w / --qc-h 是单格尺寸，--qc-gap 是间距，--qc-cols 是列数。
+   兜底值 60/48/3 与 1920 基准下的原版 cameo 一致。 */
 .qgrid {
   display: grid;
-  grid-auto-rows: 48px;
-  gap: 3px;
-  margin-top: 3px;
+  grid-auto-rows: var(--qc-h, 48px);
+  gap: var(--qc-gap, 3px);
+  margin-top: var(--qc-gap, 3px);
   justify-content: center;
 }
 
 .qitem {
   position: relative;
-  width: 60px;
-  height: 48px;
+  width: var(--qc-w, 60px);
+  height: var(--qc-h, 48px);
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, .16);
   border-radius: 3px;
@@ -1058,22 +1283,24 @@ body.paused .paused-badge { display: inline-block; }
 
 .qitem img {
   display: block;
-  width: 60px;
-  height: 48px;
+  width: 100%;
+  height: 100%;
   image-rendering: pixelated;
 }
 
 /* 通道角标：建 / 防 / 步 / 载 / 海 / 空 */
+/* 通道角标与排队数：字号跟着格子缩放（--qc-fs 由 JS 按格子宽度写入），
+   否则 32px 的格子里塞 10px 字号会把图标的可辨识区域吃光。 */
 .qitem .qtag {
   position: absolute;
   left: 1px;
   top: 1px;
-  min-width: 14px;
+  min-width: var(--qc-badge-min, 14px);
   padding: 0 2px;
   border-radius: 2px;
   background: rgba(0, 0, 0, .78);
   color: #d7e3f0;
-  font: 700 10px/13px Consolas, monospace;
+  font: 700 var(--qc-fs, 10px)/var(--qc-fs-lh, 13px) Consolas, monospace;
   text-align: center;
   pointer-events: none;
 }
@@ -1083,12 +1310,12 @@ body.paused .paused-badge { display: inline-block; }
   position: absolute;
   right: 1px;
   top: 1px;
-  min-width: 14px;
+  min-width: var(--qc-badge-min, 14px);
   padding: 0 3px;
   border-radius: 2px;
   background: rgba(0, 0, 0, .8);
   color: #ffd166;
-  font: 700 10px/13px Consolas, monospace;
+  font: 700 var(--qc-fs, 10px)/var(--qc-fs-lh, 13px) Consolas, monospace;
   text-align: center;
   pointer-events: none;
 }
@@ -1113,8 +1340,8 @@ body.paused .paused-badge { display: inline-block; }
   display: grid;
   place-items: center;
   color: #5f6d7c;
-  font: 700 12px/1 "Microsoft YaHei", sans-serif;
-  letter-spacing: .08em;
+  font: 700 var(--qc-idle-fs, 12px)/1 "Microsoft YaHei", sans-serif;
+  letter-spacing: var(--qc-idle-ls, .08em);
 }
 
 /* 数据桥还没输出 queues：用中性灰，不画成"空闲"。

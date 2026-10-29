@@ -3,7 +3,7 @@
    生成脚本：SpectatorResearch/notes/reports/HUD-字段验证工具包/_build/gen_icons_index.py */
 /* file:// 直接开页面时走相对路径；用 serve.py 时走 /icons/ 路由（见 serve.py） */
 var LIVE_ICON_BASE = window.LIVE_ICON_BASE || (location.protocol === 'file:'
-  ? (location.pathname.indexOf("/release/") !== -1 ? "../icons/" : "../../assets/icons/")
+  ? (location.pathname.indexOf("/release/") !== -1 ? "../icons/" : (location.pathname.indexOf("/前端开发/") !== -1 ? "../../SpectatorResearch/notes/reports/HUD-字段验证工具包/icons/" : "../../assets/icons/"))
   : "/icons/");
 window.LIVE_ICON_SET = {
   dir: LIVE_ICON_BASE,  /* 相对 Demo/index.html；由 serve.py 或 window.LIVE_ICON_BASE 覆盖 */

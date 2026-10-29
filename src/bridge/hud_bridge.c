@@ -98,6 +98,37 @@
  *   哪条信号在起作用；若两条都恒 0，说明 Esc 界面两者都不是，需要重新定位。
  *   刻意保留 paused：单机/观战暂停时仍有效，渲染端另有用途（计时冻结）。
  *
+ * v7.1 (2026-10-29)：--supers 默认 8 -> 32（键与 schema 不变）
+ *   R25 调研发现默认 8 会把真实对局截断：9113 次采样里 1836 次正好 8 条，
+ *   且有玩家持续触顶后又回落，说明第 9 条起被丢弃。MO 3.3.6 单玩家已授予超武
+ *   实测可达 8 条以上，8 是旧取值的经验上限而非引擎边界。
+ *   上限仍由 MAX_SUPERS 64 兜底（每玩家 supers[] 结构体预算不变，数组本就按 64 分配，
+ *   只是不再提前截断）；超武体量小（id+5 个整数），32 条约 1.5KB/玩家，8 人局可忽略。
+ *   ⚠ 未实测：提高到 32 后单玩家实际出现过的最大条数、以及是否仍有截断，需真机复核。
+ *
+ * v7.2 (2026-10-29)：supers[] 新增 drain / drain_total / manual / hidden 四个键
+ *   （schema 仍为 2，只加键，旧渲染端不受影响）。来源：MO_ExperienceEnhancements 笔记
+ *   与原版 gamemd 反汇编的交叉核对，其中两条修正了本桥此前的事实错误：
+ *   1) UseChargeDrain 在 MO 3.3.6 并非"未使用"：mo3399_rules.ini 里
+ *      BlasticadeSpecial / PsychicFlashSpecial / GoldenWindSpecial 三个均为
+ *      UseChargeDrain=true（此前按 "=yes" 检索，漏掉了 "=true" 写法）。
+ *      这三类是"运作中"而非"充能中"，且 IsReady 恒为 1（Ares 的 ClickFire 不清它），
+ *      旧逻辑 ready→pct=100 会让它们永远显示满格。现在读 SuperClass+0x7C
+ *      ChargeDrainState（0=Charging 1=Ready 2=Draining），drain==2 时
+ *      pct 改为"剩余运作时间"语义（100 往下走），分母 = total × ChargeToDrainRatio。
+ *      ratio 不跨模块读 Ares ExtData，改用 3 个已知节的静态比换算；
+ *      匹配不到回退 total（方向对、长度偏短，不报错）。
+ *   2) SW.ShowCameo=false 有 17 节（mo3399_rules.ini 实测），其中 5 节带
+ *      SidebarPCX 图标（CryomineSpawn/EMPMineSpawn/FauxDominatorSpecial/
+ *      GenomineSpawn/StasisGridSpawn），是 AI/剧情用效果。照旧采集但标 hidden=1，
+ *      由渲染端决定是否显示 —— 桥不做显示策略。
+ *   另加 manual = SuperWeaponTypeClass+0xF5 ManualControl（引擎对象字段，
+ *   已含地图内嵌 ini 的合并结果，比静态表准）。0xF5 由 YRpp 头文件字段序独立推算，
+ *   与 super/SuperWeaponTypeClass.h 一致；+0x7C 同理（IsPresent 0x6D / IsReady 0x6F /
+ *   IsSuspended 0x70 三个既有锚点均吻合）。
+ *   ⚠ 未实测：三个 drain 超武的 drain_total 是否与游戏内维持时长逐帧吻合（需开局造出
+ *     爆裂熔炉/潘多拉枢纽实测）；地图内嵌 ini 改写 ShowCameo 的节认不出来（fail-open）。
+ *
  * [TEMP-OBS-GATE-OFF 2026-10-21] 测试期临时禁用观察者判断：
  *   emit_json / emit_text 里"剔除观察者房"的两行用 #if 0 关掉，非观察者也输出全量玩家。
  *   发布前删除两处 #if 0 / #endif 即恢复 v6.1 口径（渲染端若重写需自行按 is_observer_house 过滤）。
@@ -117,7 +148,7 @@
  *   hud_bridge.exe --interval 250                   刷新间隔（毫秒，最小 100）
  *   hud_bridge.exe --out out\hud_state.json          JSON 路径
  *   hud_bridge.exe --text out\hud_text.txt           文本路径（可给 --no-text 关掉）
- *   hud_bridge.exe --supers 8                        每个玩家最多输出几颗超武
+ *   hud_bridge.exe --supers 32                       每个玩家最多输出几颗超武（默认 32，上限 64）
  *   hud_bridge.exe --record FILE.jsonl               逐帧追加（含 match_end 分隔行）
  *   hud_bridge.exe --dump-screen                     只打印一次布局+队列摘要后退出
  *   hud_bridge.exe --diag-queues [秒]                队列诊断：工厂数组/Owner/主工厂槽/类型解析
@@ -314,7 +345,9 @@
 #define S_IS_PRESENT         0x006D
 #define S_IS_READY           0x006F
 #define S_IS_SUSPENDED       0x0070
+#define S_CHARGE_DRAIN_STATE 0x007C   /* v7.2：ChargeDrainState 0=Charging 1=Ready 2=Draining */
 #define SWT_RECHARGE_TIME    0x00B0
+#define SWT_MANUAL_CONTROL   0x00F5   /* v7.2：ManualControl，引擎对象字段（已含地图内嵌 ini 合并） */
 
 /* session / scenario */
 #define SE_GAMEMODE          0x0000
@@ -716,6 +749,12 @@ struct SuperRec {
     int   suspended;
     int   total;
     int   left;
+    int   drain;      /* v7.2：ChargeDrainState，2=Draining（火风暴/电池类的运作中） */
+    int   manual;     /* v7.3：Type->ManualControl（类型级）。语义是"需玩家手动起充"，
+                         不是"某玩家能否发射" —— 它挂在共享的类型对象上，无法区分玩家。
+                         渲染端不得用它过滤，只留作排查信息 */
+    int   hidden;     /* v7.2：SW.ShowCameo=false，玩家侧栏本就不显示 */
+    int   drain_total;/* v7.2：drain 态分母 = total*ratio；ratio 未知时回退 total */
 };
 
 struct UnitTypeRec {
@@ -1069,6 +1108,25 @@ static void collect_unit_types(DWORD *houses, DWORD count, struct Snap *s)
     }
 }
 
+/* SW.ShowCameo=false 的超武（v7.2）：引擎不给它们画 cameo，玩家侧栏永远看不到，
+   多数是 AI/剧情触发效果。这里照旧采集（观战端可能需要知道"对面有没有这个能力"），
+   但标 hidden，渲染端默认不显示。名单来自 mo3399_rules.ini 实测 17 节。
+   ⚠ 这份是静态表：地图内嵌 ini 可以改写，改写的节这里认不出来（fail-open，
+     宁可多显示一个也不误藏）。 */
+static int super_cameo_hidden(const char *id)
+{
+    static const char *tab[] = {
+        "ArsenalMedicSpawn", "ConfusionGridSpawn", "CraneSpecial", "CrateDropSpecial",
+        "CryomineSpawn", "EMPMineSpawn", "EliteReservesMessage", "FakeChemplugSpawn",
+        "FauxDominatorSpecial", "GenomineSpawn", "IronGuardSpecial", "KnightfallSpawn",
+        "PsychicBeaconSpecial", "ReproCashFix", "StasisGridSpawn", "SuperFlashSpawn",
+        "TickTrapSpawn", 0
+    };
+    int i;
+    for (i = 0; tab[i]; ++i) if (!strcmp(id, tab[i])) return 1;
+    return 0;
+}
+
 /* 超武：全局扫描，只保留 IsPresent=1 */
 static int collect_supers(DWORD frame, struct SuperRec *out, int maxn)
 {
@@ -1080,7 +1138,7 @@ static int collect_supers(DWORD frame, struct SuperRec *out, int maxn)
     for (i = 0; i < count && n < maxn; ++i) {
         DWORD sp = 0, stype = 0, owner = 0;
         int custom = -1, total = 0, start = 0, left = 0, pct = 0;
-        int present = 0, ready = 0, susp = 0;
+        int present = 0, ready = 0, susp = 0, drain = 0, manual = 1;
         if (!rd_u32(items + i * 4, &sp) || !sp) continue;
         if (!rd(sp, blk, sizeof(blk))) continue;
         present = *(unsigned char *)(blk + S_IS_PRESENT);
@@ -1093,25 +1151,48 @@ static int collect_supers(DWORD frame, struct SuperRec *out, int maxn)
         left = *(int *)(blk + S_RECHARGE_TIMER + 8);
         ready = *(unsigned char *)(blk + S_IS_READY);
         susp = *(unsigned char *)(blk + S_IS_SUSPENDED);
+        drain = *(int *)(blk + S_CHARGE_DRAIN_STATE);
         if (custom > 0) total = custom;
         else if (stype) rd_i32(stype + SWT_RECHARGE_TIME, &total);
-        if (ready) pct = 100;
-        else if (total > 0) {
+        /* ManualControl（Type+0xF5）是类型级"需手动起充"标志，不是"某玩家能否发射"。
+           反汇编佐证：sub_6CB4EF 里 MC==0 时引擎自动起充，MC!=0 时跳过等玩家点。
+           同类型对象全玩家共享，因此它无法表达玩家差异 —— 采集但不过滤。 */
+        if (stype) { unsigned char mc = 1; rd_u8(stype + SWT_MANUAL_CONTROL, &mc); manual = mc ? 1 : 0; }
+        out[n].owner = owner;
+        out[n].id[0] = 0;
+        if (stype) rd_str(stype + T_ID, out[n].id, sizeof(out[n].id));
+        if (!out[n].id[0]) strcpy(out[n].id, "?");
+        /* drain 态（火风暴/电池类运作中）的 pct 语义：原版侧栏画的是"剩余运作时间"，
+           从 100 往下走。分母直接用引擎自己的计时器预算 —— TimerStruct::Start(duration)
+           把 TimeLeft 写成时长、之后再不递减，所以 draining 期间的 raw TimeLeft 就是
+           维持时长本身（Ares 激活时调的就是 Start(drainDuration)）。
+           这样不需要跨模块读 Ares 的 ChargeToDrainRatio，也不怕地图内嵌 ini 改了 ratio。 */
+        out[n].drain_total = total;
+        if (drain == 2 && start != -1 && left > 0) {
+            int dt = left;                 /* 引擎给的维持时长（帧） */
+            int rem = left - ((int)frame - start);
+            if (rem < 0) rem = 0;
+            pct = (int)(100.0 * (double)rem / (double)dt);
+            if (pct < 0) pct = 0;
+            if (pct > 100) pct = 100;
+            out[n].drain_total = dt;
+        } else if (ready) {
+            pct = 100;
+        } else if (total > 0) {
             int rem = left;
             if (start != -1) { rem = left - ((int)frame - start); if (rem < 0) rem = 0; }
             pct = (int)(100.0 * (double)(total - rem) / (double)total);
             if (pct < 0) pct = 0;
             if (pct > 100) pct = 100;
         }
-        out[n].owner = owner;
-        out[n].id[0] = 0;
-        if (stype) rd_str(stype + T_ID, out[n].id, sizeof(out[n].id));
-        if (!out[n].id[0]) strcpy(out[n].id, "?");
         out[n].pct = pct;
         out[n].ready = ready;
         out[n].suspended = susp;
         out[n].total = total;
         out[n].left = left;
+        out[n].drain = (drain >= 0 && drain <= 2) ? drain : -1;
+        out[n].manual = manual;
+        out[n].hidden = super_cameo_hidden(out[n].id);
         n++;
     }
     return n;
@@ -1932,11 +2013,15 @@ static void emit_json(SB *b, const struct Snap *s, DWORD pid)
         for (k = 0; k < p->nsupers; ++k) {
             if (k) sb_add(b, ", ");
             sb_add(b, "{\"id\": "); sb_json(b, p->supers[k].id);
-            sb_printf(b, ", \"pct\": %d, \"ready\": %s, \"suspended\": %s, \"total\": %d, \"left\": %d}",
+            sb_printf(b, ", \"pct\": %d, \"ready\": %s, \"suspended\": %s, \"total\": %d, \"left\": %d"
+                         ", \"drain\": %d, \"drain_total\": %d, \"manual\": %s, \"hidden\": %s}",
                       p->supers[k].pct,
                       p->supers[k].ready ? "true" : "false",
                       p->supers[k].suspended ? "true" : "false",
-                      p->supers[k].total, p->supers[k].left);
+                      p->supers[k].total, p->supers[k].left,
+                      p->supers[k].drain, p->supers[k].drain_total,
+                      p->supers[k].manual ? "true" : "false",
+                      p->supers[k].hidden ? "true" : "false");
         }
         sb_add(b, "], ");
         /* 生产队列（v6.6）：只输出 active 的通道；没有工厂的通道整个键省略，
@@ -2084,12 +2169,22 @@ static int dry_run(const char *out, const char *text)
     s.players[0].lost_units = 37; s.players[0].points = 81993;
     s.players[0].has_centroid = 1; s.players[0].cent_x = 126; s.players[0].cent_y = 33;
     s.players[0].cent_bld = 22; s.players[0].spawn_pos = 0;
-    s.players[0].nsupers = 2;
+    s.players[0].nsupers = 3;
     strcpy(s.players[0].supers[0].id, "IronCurtainSpecial");
     s.players[0].supers[0].pct = 64; s.players[0].supers[0].total = 6000; s.players[0].supers[0].left = 2160;
+    s.players[0].supers[0].drain = 0; s.players[0].supers[0].drain_total = 6000;
+    s.players[0].supers[0].manual = 1; s.players[0].supers[0].hidden = 0;
     strcpy(s.players[0].supers[1].id, "SpyPlaneSpecial");
     s.players[0].supers[1].pct = 100; s.players[0].supers[1].ready = 1;
     s.players[0].supers[1].total = 3600; s.players[0].supers[1].left = 0;
+    s.players[0].supers[1].drain = 1; s.players[0].supers[1].drain_total = 3600;
+    s.players[0].supers[1].manual = 1; s.players[0].supers[1].hidden = 0;
+    /* v7.2 新增样例：火风暴类运作中（drain=2，pct 从 100 往下走） */
+    strcpy(s.players[0].supers[2].id, "BlasticadeSpecial");
+    s.players[0].supers[2].pct = 62; s.players[0].supers[2].ready = 1;
+    s.players[0].supers[2].total = 250; s.players[0].supers[2].left = 155;
+    s.players[0].supers[2].drain = 2; s.players[0].supers[2].drain_total = 125;
+    s.players[0].supers[2].manual = 1; s.players[0].supers[2].hidden = 0;
     s.players[0].nunit_types = 3;
     strcpy(s.players[0].unit_types[0].id, "HTNK");
     s.players[0].unit_types[0].count = 6; s.players[0].unit_types[0].hp = 2600; s.players[0].unit_types[0].maxhp = 3200; s.players[0].unit_types[0].veterancy = 1;
@@ -2142,7 +2237,7 @@ static int dry_run(const char *out, const char *text)
 int main(int argc, char **argv)
 {
     DWORD pid = 0;
-    int interval = 500, max_supers = 8, i;
+    int interval = 500, max_supers = 32, i;
     char out[MAX_PATH] = "out\\hud_state.json";
     char text[MAX_PATH] = "out\\hud_text.txt";
     char record[MAX_PATH] = "";

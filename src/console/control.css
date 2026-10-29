@@ -847,3 +847,34 @@ kbd {
   #btnCopy .btnTxt { display: none; }
   .statusbar .title { min-width: 0; }
 }
+
+/* ---------------------------------------------------------------- 支援技能页（R29）
+   复用「单位」页的 .urow / .ulist / .ustat / .udetail 骨架，
+   这里只补两个徽标和优先顺序列表。 */
+.bdg.prio { background: rgba(var(--acc-rgb), .14); color: var(--blue-fg); }
+.swrow.hid .ic { filter: grayscale(1) brightness(.6); opacity: .6; }
+.swrow.hid .id { color: var(--dim); }
+.swrow .actbtn + .actbtn { margin-left: 4px; }
+
+/* 关闭支援技能时把下面的列表压暗，明确"现在不生效" */
+#supersBody.off { opacity: .45; pointer-events: none; }
+
+.prow {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 6px; border-radius: 6px;
+  border: 1px solid transparent;
+}
+.prow + .prow { border-top: 1px dashed var(--line); }
+.prow:hover { background: var(--row-hover); border-color: var(--line-2); }
+.prow .n {
+  flex: none; width: 16px; height: 16px; border-radius: 4px;
+  display: grid; place-items: center;
+  background: rgba(var(--acc-rgb), .14); color: var(--blue-fg);
+  font: 600 9.5px/1 Consolas, monospace;
+}
+.prow .nm { flex: 1; min-width: 0; font-size: 11.5px; color: var(--txt); }
+.prow .nm u {
+  display: block; text-decoration: none; margin-top: 1px;
+  font: 9.5px/1.2 Consolas, monospace; color: var(--dim);
+}
+.btn.xs { padding: 2px 5px; font-size: 10px; line-height: 1.3; }

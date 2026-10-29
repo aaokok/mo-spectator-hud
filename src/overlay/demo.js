@@ -47,7 +47,14 @@
     perTeam: 3,
     mockPerTeam: 3,      /* live 会覆盖 perTeam，回 mock 时用它还原 */
     railMax: 8,
+    /* 生产队列的格子几何。不是常量：applyAnchors 按面板实际宽度反推，
+       侧栏窄（高分辨率缩下来只有 ~113 设计 px）时整体缩小图标而不是减列。
+       单位是 HUD 设计像素，60×48 是原版 cameo 尺寸。 */
     queueCols: 3,
+    queueCellW: 60,
+    queueCellH: 48,
+    queueGap: 3,
+    queuePadX: 16,
     source: 'mock',      /* mock | live */
     liveUrl: '',
     liveModel: null,     /* live-data.js 映射后的模型 */
@@ -601,26 +608,175 @@
     '</div>';
   }
 
+  /* ---------------------------------------------------------------
+     生产队列的格子几何推导。
+
+     为什么不写死 60px：HUD 按 1920 设计像素排版，但游戏侧栏的宽度是
+     **游戏像素**乘画布缩放得来的。2560×1440 的局缩到 1920 后，168 游戏像素
+     只剩约 126 设计像素，原来那条 floor((qW-16+4)/64) 会直接算成 1 列，
+     6 条通道变成 6 行，面板长得离谱。
+
+     现在的策略：优先保住 3 列 × 2 行（原版建造栏的形状），把格子等比缩小；
+     小到 MIN 还放不下才减列。参数全部落在 state 上，CSS 通过 --qc-w 等
+     变量消费，所以以后要改布局（改成 4 列、加边框、换间距）只动这里。 */
+  /* 单格基准尺寸（原版 cameo 60×48）。要改布局形状，改这几个常量即可：
+     Q_COLS_PREF 决定优先保几列；Q_MIN_W 决定缩到多小才放弃这个列数。 */
+  var Q_FULL_W = 60, Q_FULL_H = 48;
+  var Q_MIN_W = 32;              /* 再小图标就认不出，宁可减列 */
+  var Q_GAP = 3;                 /* 格子间距，也是 .qgrid 的 margin-top */
+  var Q_PAD_X = 16;              /* .qpanel 左右内边距 + 边框 + 余量 */
+  var Q_CHANNELS = 6;            /* building/defense/infantry/vehicle/navy/aircraft */
+  /* 列数候选：从"原版形状"往下降。加 4 列之类的新布局，改这个数组即可。 */
+  var Q_COL_CANDIDATES = [3, 2, 1];
+
+  /* 按可用宽度推导格子尺寸与列数。
+     策略：从最想要的列数开始试，能放下就等比缩小格子（不轻易减列，
+     因为减列会把 6 条通道从 2 行拉成 3~6 行，面板变得很长）；
+     缩到 Q_MIN_W 还放不下才试下一个列数。 */
+  function applyQueueGeometry(qW) {
+    var avail = Math.max(0, (qW || 0) - Q_PAD_X);
+    var cols = 1, cellW = Q_MIN_W;
+
+    for (var i = 0; i < Q_COL_CANDIDATES.length; i++) {
+      var c = Q_COL_CANDIDATES[i];
+      var gapTotal = (c - 1) * Q_GAP;
+      var fit = Math.floor((avail - gapTotal) / c);
+      if (fit >= Q_MIN_W) {
+        /* 这个列数能保住：格子宽夹在 [MIN, FULL] 之间 */
+        cols = c;
+        cellW = Math.min(Q_FULL_W, fit);
+        break;
+      }
+      /* 最后一个候选也放不下：用最少的列数 + 最小格子兜底，
+         宁可轻微溢出（overflow-x 已锁 hidden）也不让面板完全没格 */
+      if (i === Q_COL_CANDIDATES.length - 1) {
+        cols = c;
+        cellW = Q_MIN_W;
+      }
+    }
+
+    var cellH = Math.max(24, Math.round(cellW * Q_FULL_H / Q_FULL_W));
+    var rows = Math.ceil(Q_CHANNELS / cols);
+
+    state.queueCols = cols;
+    state.queueCellW = cellW;
+    state.queueCellH = cellH;
+    state.queueGap = Q_GAP;
+    state.queuePadX = Q_PAD_X;
+    state.queueCols1 = Math.ceil(rows);      /* 实际行数，供调试/后续改造用 */
+    state.queueW = qW;
+  }
+
+  /* 把几何写成 CSS 变量，样式表里不再出现 60/48/3 这些魔法数。
+     写在 .queue-column 上即可被所有 .qpanel/.qitem 继承，
+     不需要逐个面板设置；以后加新面板也不用改这里。 */
+  function queueGeomVars() {
+    var col = $('#queueColumn');
+    if (!col) return;
+    var w = state.queueCellW || 60;
+    /* 字号按格子宽度等比缩：60px 时保持原来的 10/13/12/9，缩到 32px 时约 5~6px。
+       下限 6px —— 再小在直播压缩后也认不出，不如靠颜色/数量。
+       注意 badge 的 line-height 用整数像素，避免半像素高度导致边框糊。 */
+    var k = w / 60;
+    var fs = Math.max(6, Math.round(10 * k));
+    var fsLh = Math.max(8, Math.round(13 * k));
+    var idleFs = Math.max(6, Math.round(12 * k));
+    var uidFs = Math.max(6, Math.round(9 * k));
+    var badgeMin = Math.max(10, Math.round(14 * k));
+    var vars = {
+      '--qc-w': w + 'px',
+      '--qc-h': (state.queueCellH || 48) + 'px',
+      '--qc-gap': (state.queueGap || 3) + 'px',
+      '--qc-cols': String(state.queueCols || 3),
+      '--qc-fs': fs + 'px',
+      '--qc-fs-lh': fsLh + 'px',
+      '--qc-idle-fs': idleFs + 'px',
+      '--qc-idle-ls': (k < 0.8 ? '0' : '.08em'),
+      '--qc-uid-fs': uidFs + 'px',
+      '--qc-badge-min': badgeMin + 'px'
+    };
+    for (var k2 in vars) col.style.setProperty(k2, vars[k2]);
+  }
+
+  /* 侧栏列数：多玩家恒 2 列；1v1 原本是单列窄栏，
+     开了支援技能后放宽到 2 列（60px 技能格两列才有横向空间）。 */
+  function railCols() {
+    return state.perTeam <= 1 && !supersOn() ? 1 : 2;
+  }
+
   /* 单位栏能放几类：按栏高 ÷ 玩家数 分摊，再换算成行数 × 列数。
-     栏高本身已被 applyLayout 收到可用高度的 65%（RAIL_FILL），
-     这里直接用 clientHeight，不再二次缩放。 */
+     栏高本身已被 applyLayout 收到 RAIL_MAX_FRAC，这里直接用 clientHeight，不再二次缩放。 */
   var RAIL_FILL = 0.65;
 
+  /* 侧栏垂直占用上限：**不超过游戏画面总高的 70%**（用户硬约束）。
+     这是天花板，不是目标值：可用高度不足时按可用高度取，超过就截到 70%。
+     HUD 设计层固定 1920×1080（舞台靠 transform 缩放），所以"游戏画面总高"
+     在设计像素里恒为 1080；有真实几何时用 geom.gameH，口径一致。
+     两个格区（单位/技能）的行配额都从这里派生，因此侧栏本体与内部内容
+     共用同一个高度预算，改这一处就能整体收放。 */
+  var RAIL_MAX_FRAC = 0.70;
+
+  /* 一张卡片除格子外的固定开销：旗帜/名字行 + 上下内边距 + 边框。 */
+  var CARD_HEAD_H = 24;
+  var CARD_PAD_H = 12;
+  var CARD_GAP_H = 8;
+  var ROW_H = 52;          /* 48 图标 + 4 间距 */
+  /* 技能区分隔线的总占用：margin-top 6 + padding-top 6 + border 1，
+     与 demo.css 的 .sw-sec 逐项对齐。改样式必须同步改这里，否则行配额算错。 */
+  var SW_SEP_H = 13;
+
+  /* 单位格与支援技能格**各有独立上限**，互不抢格子。
+     做法：把卡片可用格区的行数按**固定比例**切开 —— 技能区拿 SW_SHARE 份，
+     单位区拿剩下的。切分只跟卡片高度有关，跟两边实际有多少内容无关，
+     所以：
+       · 技能格再多，也只会把技能区自己的超出量收成 +N，单位区行数不变；
+       · 单位格再多，也只会在单位区自己收 +N，不会把技能挤没。
+     开关没开时技能区配额为 0，单位区独占全部行数（与改造前一致）。 */
+  var SW_SHARE = 0.5;      /* 技能区占卡片格区行数的固定份额 */
+
+  /* 这张卡片可用的格区高度（不含 head/padding/border） */
+  function cardGridBudget() {
+    var rail = $('[data-rail="A"]');
+    if (!rail) return 0;
+    var n = Math.max(1, state.perTeam);
+    var perCard = (rail.clientHeight - n * (CARD_HEAD_H + CARD_PAD_H)
+                   - (n - 1) * CARD_GAP_H) / n;
+    return Math.max(ROW_H, perCard - CARD_HEAD_H - CARD_PAD_H);
+  }
+
+  /* 算出两个互不重叠的行数配额：[单位行数, 技能行数]。
+     只依赖卡片高度，不依赖内容量 —— 这是"不互相抢"的关键。 */
+  function rowQuota() {
+    var budget = cardGridBudget();
+    /* 技能区存在时要额外扣掉分隔线高度 */
+    var swOn = supersOn();
+    var avail = swOn ? Math.max(ROW_H, budget - SW_SEP_H) : budget;
+    var total = Math.max(1, Math.floor((avail + 4) / ROW_H));
+    if (!swOn) return [total, 0];
+    /* 至少各留 1 行，其余按 SW_SHARE 切给技能区 */
+    var swRows = Math.max(1, Math.round(total * SW_SHARE));
+    if (swRows >= total) swRows = total - 1;
+    return [Math.max(1, total - swRows), swRows];
+  }
+
+  /* 单位栏上限：独立配额，超出的收成 +N。 */
   function railMaxUnits() {
     var rail = $('[data-rail="A"]');
     if (!rail) return 8;
+    var cols = railCols();
+    var q = rowQuota();
+    state._rowsUnits = q[0];
+    state._rowsSupers = q[1];
+    return Math.max(cols, Math.min(24, q[0] * cols));
+  }
 
-    var cols = state.perTeam <= 1 ? 1 : 2;
-    var n = Math.max(1, state.perTeam);
-    var headH = 24;        /* 旗帜 + 名字行 */
-    var cardPad = 12;      /* 卡片上下内边距 */
-    var cardGap = 8;
-    var rowH = 52;         /* 48 图标 + 4 间距 */
-
-    var perCard = (rail.clientHeight - n * (headH + cardPad) - (n - 1) * cardGap) / n;
-    var rows = Math.max(1, Math.floor((perCard + 4) / rowH));
-
-    return Math.max(cols, Math.min(24, rows * cols));
+  /* 支援技能上限：同一份配额的技能侧，返回格数。null = 不生效。 */
+  function railMaxSupers(cols) {
+    if (!supersOn()) return null;
+    var q = rowQuota();
+    var rows = q[1];
+    if (!rows) return null;
+    return Math.max(cols, rows * cols);
   }
 
   function railList(p, max) {
@@ -655,7 +811,122 @@
         '<span class="rn">' + esc(p.name) + '</span>' +
       '</div>' +
       '<div class="rp-grid" style="grid-template-columns:repeat(' + cols + ',60px)"></div>' +
+      '<div class="sw-sec"></div>' +
     '</div>';
+  }
+
+  /* 支援技能的发条件：cost<0 表示发射时扣款（Ares Money.Amount），
+     needsPower 来自 IsPowered=yes（断电/EMP 时引擎置 IsSuspended）。
+     静态表见 assets/sw-cond.js；表里没有的 ID 一律按"无金钱条件"处理，
+     宁可少画一个角标，也不要在没数据时凭空报缺钱。 */
+  function swCond(id) {
+    var t = window.SW_COND && window.SW_COND[id];
+    if (!t) return { cost: 0, power: false };
+    return { cost: t[0] || 0, power: !!t[1] };
+  }
+
+  /* 能不能真按下去：充能满 + 钱够 + 供电正常。三者缺一，点下去都没反应。
+     缺钱判定用 Ares 的原始语义：cash + cost >= 0（发射瞬间扣款，不够就中止）。 */
+  function superUsable(p, s) {
+    var c = swCond(s.id);
+    var moneyOk = !(c.cost < 0) || ((p.cash || 0) + c.cost >= 0);
+    var powerOk = !c.power || !s.suspended;
+    return { moneyOk: moneyOk, powerOk: powerOk, ok: moneyOk && powerOk };
+  }
+
+  /* 支援技能格子。图标走 /icons/sw/<id>.png（桥的 supers[].id 就是节名，
+     与图标文件名一一对应，见 _sw_manifest.json）。
+     视觉分四种互斥状态（详见 demo.css）：
+       run      drain=2，条表示剩余运作时间（方向与充能相反），青色脉动
+       susp     引擎把充能停了（断电/EMP/手动）→ 灰得更深
+       nocond   充能满但钱不够/断电 → 灰 + 琥珀描边
+       其余     charging，灰 + 蓝条
+     R33 去掉了顶部的"就绪"文字徽标：就绪态已有全彩图标 + 绿框 + 绿光，
+     三重绿提示已经把意思说完了，再加 7px 小字只会压住图标主体。
+     "运行" 徽标保留 —— drain 类的条是 100→0 的剩余运作时间，
+     和"正在充能"方向相反，没有文字时观众难以分辨是攒还是耗。
+     状态类名用 nocond 而**不是 blocked**：index.html 里有一个全局遮罩
+     `.blocked{position:absolute;inset:0;display:none}`,同名会让整格消失。 */
+  function superCell(s, p) {
+    var c = swCond(s.id);
+    var cond = superUsable(p, s);
+    var run = !!s.draining;
+    var nac = !!s.ready && !cond.ok && !run;
+    var cls = 'sw';
+    if (run) cls += ' run';
+    else if (s.suspended) cls += ' susp';
+    if (nac) cls += ' nocond';
+    if (!s.ready || !cond.ok) cls += ' charging';
+    if (s.ready && cond.ok && !s.suspended && !run) cls += ' ready';
+    if (s.once) cls += ' once';
+
+    var src = '/icons/sw/' + s.id + '.png';
+    var pct = Math.max(0, Math.min(100, s.pct || 0));
+    var moneyOff = (c.cost < 0) && !cond.moneyOk;
+    var powerOff = c.power && !cond.powerOk;
+    /* width/height 属性必须显式写：.sw-sec 是 grid，未加载完的 img 若只有
+       CSS 尺寸，会先按 intrinsic 比例占位再跳变；而 onerror 藏图会让整格空白。
+       失败时重试一次（并发加载偶发解码失败，不是文件坏 —— 96 张 PNG 全部校验过）。 */
+    return '<div class="' + cls + '" title="' + esc(s.id) + ' · ' + Math.round(pct) + '%">' +
+      '<img src="' + src + '" alt="" width="60" height="48" decoding="async"' +
+      ' onerror="if(!this.dataset.r){this.dataset.r=1;this.src=this.src;}else{this.style.display=\'none\'}">' +
+      '<div class="cov"></div>' +
+      '<div class="fill" style="width:' + pct.toFixed(1) + '%"></div>' +
+      (run ? '<div class="rdy">运行</div>' : '') +
+      '<div class="cond money' + (moneyOff ? ' off' : '') + '">$</div>' +
+      '<div class="cond power' + (powerOff ? ' off' : '') + '">⚡\uFE0E</div>' +
+      '<div class="tag1">×1</div>' +
+    '</div>';
+  }
+
+  /* R29 支援技能栏（F 方案）的总开关：控制台打开 **且** 当前是 1v1。
+     多玩家对局一律不插技能 —— 面板会过高，而 1v1 才有横向空间放宽到两列。
+     不生效时完全维持原状：不画技能、rail 宽度与列数都不动。 */
+  function supersOn() {
+    return !!(window.__CTRL_STATE && window.__CTRL_STATE.show_supers) && state.perTeam <= 1;
+  }
+
+  /* R29 超武自定义：控制台的三组配置（开关/优先顺序/隐藏名单）。
+     注意这些是**超武节名**（NukeSpecial…），与单位页的 hidden_units（HTNK…）
+     完全分离，互不干扰。 */
+  function superCustom() {
+    var c = window.__SUPER_CUSTOM;
+    if (!c) return null;
+    return c;
+  }
+
+  /* 只画"玩家侧栏本就会显示"的：hidden=ShowCameo=false 是 AI/剧情用效果，
+     引擎不给它画 cameo，观战端也不画。
+     ⚠ 不要用 manual 过滤。ManualControl（Type+0xF5）是**类型级**字段 ——
+     同一个超武在整个游戏里只有一个类型对象、所有玩家共享，从原理上就表达不了
+     "某个玩家能不能发射"；它的语义是"要不要玩家手动起充"。
+     实测 MO 3.3.6 全部 135 个超武类型 / 540 个实例该字节恒为 0，
+     拿它过滤会把 AI 房已造出且已充满的技能全部滤空。
+     控制台的 hidden_supers 再叠一层，并按 super_priority 重排。 */
+  function superList(p) {
+    var src = p.supers || [];
+    var custom = superCustom();
+    var hid = (custom && custom.hid) || null;
+    var prio = (custom && custom.prio) || null;
+    var out = [];
+    for (var i = 0; i < src.length; i++) {
+      if (src[i].hidden) continue;
+      if (hid && hid.indexOf(src[i].id) >= 0) continue;
+      out.push(src[i]);
+    }
+    /* 优先表里的按表序排前面，其余保持桥输出原序接在后面。
+       用稳定排序，不改变同权重项目的相对次序。 */
+    if (prio && prio.length) {
+      out = out
+        .map(function (s, i) { return { s: s, i: i, r: prio.indexOf(s.id) }; })
+        .sort(function (a, b) {
+          var ra = a.r < 0 ? 1e9 : a.r;
+          var rb = b.r < 0 ? 1e9 : b.r;
+          return ra !== rb ? ra - rb : a.i - b.i;
+        })
+        .map(function (x) { return x.s; });
+    }
+    return out;
   }
 
   function updateRailCard(card, p, cols, max) {
@@ -700,10 +971,83 @@
         var cnt = cell.querySelector('.cnt');
         if (cnt && cnt.textContent !== String(u.count)) cnt.textContent = u.count;
       });
+
+    /* 支援技能区：接在单位格下方。关闭开关时不画（连节点都不留），
+       没技能时整块收起，不占高度。 */
+    var sec = card.querySelector('.sw-sec');
+    if (!sec) return;
+    var sws = supersOn() ? superList(p) : [];
+    if (!sws.length) {
+      if (sec.childElementCount) sec.innerHTML = '';
+      sec.style.display = 'none';
+      return;
+    }
+    sec.style.display = '';
+    var wantCols = 'repeat(' + cols + ',60px)';
+    if (sec.style.gridTemplateColumns !== wantCols) sec.style.gridTemplateColumns = wantCols;
+    /* 超上限的收成 +N 尾格，和单位区同一套规则：否则对局后期十几个技能
+       会把卡片撑出侧栏、压住战场。capSw 为 null 时（开关没开）不限制。 */
+    var capSw = railMaxSupers(cols);
+    var swsShown = sws;
+    var swsRest = 0;
+    if (capSw !== null && sws.length > capSw) {
+      /* 有 +N 时留一格给它，避免多出一行把卡片撑高 */
+      var keepN = Math.max(1, capSw - 1);
+      swsShown = sws.slice(0, keepN);
+      swsRest = sws.length - swsShown.length;
+    }
+    var swItems = swsShown.map(function (s) { return { k: s.id, s: s }; });
+    if (swsRest > 0) swItems.push({ k: '__swmore', s: null });
+    /* 每格只刷进度与文案，不整块重建（live 500ms 一帧，重建会打断 hover） */
+    patchChildren(sec, swItems,
+      function (it) { return it.k; },
+      function (it) { return elFromHtml(it.s ? superCell(it.s, p)
+        : '<div class="sw more">+' + swsRest + '</div>'); },
+      function (cell, it) {
+        if (!it.s) {                        /* +N 汇总格：只刷数字 */
+          cell.textContent = '+' + swsRest;
+          return;
+        }
+        var s = it.s;
+        var c = swCond(s.id);
+        var cond = superUsable(p, s);
+        var run = !!s.draining;
+        var ready = !!s.ready && cond.ok && !s.suspended && !run;
+        var nac = !!s.ready && !cond.ok && !run;
+
+        var pct = Math.max(0, Math.min(100, s.pct || 0));
+        var fill = cell.querySelector('.fill');
+        if (fill) fill.style.width = pct.toFixed(1) + '%';
+
+        /* "运行"徽标随状态增删：格子按 key 复用，充电→运行的切换不会重建 DOM。
+           就绪态不再有徽标（用户要求），所以这里只处理 run 一种。 */
+        var rdy = cell.querySelector('.rdy');
+        if (run && !rdy) {
+          rdy = document.createElement('div');
+          rdy.className = 'rdy';
+          rdy.textContent = '运行';
+          cell.appendChild(rdy);
+        } else if (!run && rdy) {
+          rdy.remove();
+        }
+
+        var m = cell.querySelector('.cond.money');
+        if (m) m.classList.toggle('off', (c.cost < 0) && !cond.moneyOk);
+        var pw = cell.querySelector('.cond.power');
+        if (pw) pw.classList.toggle('off', c.power && !cond.powerOk);
+
+        cell.classList.toggle('run', run);
+        cell.classList.toggle('susp', !run && !!s.suspended);
+        cell.classList.toggle('ready', ready);
+        cell.classList.toggle('nocond', nac);
+        cell.classList.toggle('charging', !ready && !run);
+        cell.classList.toggle('once', !!s.once);
+        cell.title = s.id + ' · ' + Math.round(pct) + '%';
+      });
   }
 
   function renderRails() {
-    var cols = state.perTeam <= 1 ? 1 : 2;
+    var cols = railCols();
     var max = state.railMax || 8;
 
     ['A', 'B'].forEach(function (key) {
@@ -809,7 +1153,7 @@
         '<span class="qtitle">' + esc(p.name) + '</span>' +
         '<span class="qcount"></span>' +
       '</div>' +
-      '<div class="qgrid" style="grid-template-columns:repeat(' + cols + ',60px)"></div>' +
+      '<div class="qgrid" style="grid-template-columns:repeat(' + cols + ',var(--qc-w,60px))"></div>' +
     '</div>';
   }
 
@@ -825,7 +1169,7 @@
 
     var grid = panel.querySelector('.qgrid');
     if (!grid) return false;
-    var want = 'repeat(' + cols + ',60px)';
+    var want = 'repeat(' + cols + ',var(--qc-w,60px))';
     if (grid.style.gridTemplateColumns !== want) grid.style.gridTemplateColumns = want;
 
     /* VET 徽标按渗透状态原位增删，不重建整卡 */
@@ -904,6 +1248,7 @@
   }
 
   function renderQueues() {
+    queueGeomVars();
     if (!queueColumn) return;
 
     if (!queueChk.checked) {
@@ -925,8 +1270,8 @@
     /* R23：队列列被收起/恢复会改变遮挡区域，重报一次 */
     reportCoverRegions();
 
-    /* 列数由 applyAnchors 按面板实际宽度反算，不要在这里兜底成 2 列：
-       真实侧栏缩放后只有 ~126 px，2 列（60+3+60=123 + 内边距）会溢出。 */
+    /* 列数与格子尺寸都由 applyAnchors 的 applyQueueGeometry 按面板实际宽度
+       反算（侧栏窄时缩小图标而不是减列），这里只读结果，不做二次兜底。 */
     var cols = Math.max(1, state.queueCols || 3);
 
     patchChildren(queueColumn, visiblePlayers(), playerKey,
@@ -1183,17 +1528,23 @@
     top.classList.toggle('in-margin', barInMargin);
 
     var railTop = barTop + BAR_H + gap;
-    /* 侧栏只占可用高度的 65%：再往下就压住战场了。
-       railH 同时作为 railMaxUnits() 的 clientHeight 来源，
-       所以这里收窄后单位格数上限会自动跟着降。 */
+    /* 侧栏高度 = min(可用高度 × RAIL_FILL, 游戏画面高 × 70%)，且不小于 120。
+       70% 是硬天花板（用户约束）：可用高度富余时也不会超过它；
+       可用高度不足时（小窗/竖屏）按可用高度走，避免压住视口下沿。
+       railH 同时是 railMaxUnits()/railMaxSupers() 的 clientHeight 来源，
+       所以收窄后两个格区的行配额都会自动跟着降。 */
     var railAvail = Math.max(120, (vy + viewH) - railTop - bottomPad);
-    var railH = Math.max(120, Math.round(railAvail * RAIL_FILL));
+    var gameHForRail = (geom && geom.gameH) ? geom.gameH : vh;
+    var railCap = Math.round(gameHForRail * RAIL_MAX_FRAC);
+    var railH = Math.max(120, Math.min(Math.round(railAvail * RAIL_FILL), railCap));
     state._railAvail = railAvail;
     state._railH = railH;
+    state._railCap = railCap;
     var railGap = 14;
 
-    /* 1v1 用单列，宽度只够一格图标，减少遮挡 */
-    var single = state.perTeam <= 1;
+    /* 1v1 不开支援技能时用单列窄栏，减少遮挡；
+       开了支援技能则放宽到正常两列宽度（否则 2 列 60px 图标塞不下）。 */
+    var single = state.perTeam <= 1 && !supersOn();
     var railW = single ? 84 : RAIL_W;
 
     /* 画布黑边留白：左右两侧都要跟**游戏整体**比，不能跟战术视口比。
@@ -1242,11 +1593,10 @@
     queueColumn.style.display =
       (queueChk.checked && (state.overlay || gameUiChk.checked)) ? '' : 'none';
 
-    /* 队列每行能放几个 60px 图标；6 条通道固定 2 行 × 3 列，
-       窄到放不下 3 列时退成 2 列 × 3 行 */
-    /* 队列每行能放几个 60px 图标。侧栏真实宽 168 px、按画布缩放后可能只剩 ~126 设计 px，
-       这时候只能放 1 列（2 列需要 124+3=127，会溢出）。 */
-    state.queueCols = Math.max(1, Math.min(3, Math.floor((qW - 16 + 4) / 64)));
+    /* 队列几何：先按"3 列放得下就用原尺寸"试，放不下就等比缩小图标，
+       而不是直接减列 —— 减列会让 6 条通道从 2 行变 6 行，把面板拉得老长。
+       60×48 是原版 cameo 尺寸；最小到 32×26，再窄才退列数（极端情况兜底）。 */
+    applyQueueGeometry(qW);
 
     /* 小地图整块不渲染（2026-10-23）：原版雷达在那块区域，我们的 HUD 不画雷达。
        这里只保留隐藏动作，不写任何位置——避免以后有人"顺手"把它再打开。 */
@@ -1488,7 +1838,7 @@
   function guessLiveUrl() {
     /* file:// 下 fetch 会被 CORS 拦；用本地服务时走 /state/ 路由（serve.py） */
     if (location.protocol === 'file:') {
-      return (location.pathname.indexOf('/release/') !== -1 ? '../out/hud_state.json' : '../../release/out/hud_state.json');
+      return '../../SpectatorResearch/notes/reports/HUD-字段验证工具包/out/hud_state.json';
     }
     return '/state/out/hud_state.json';
   }
@@ -2085,6 +2435,11 @@
     rebuildUnitCustom();
     relayoutAndRender();
   });
+
+  /* R29：支援技能开关/优先顺序/隐藏名单变化 → 整层重排。
+     必须走 relayoutAndRender 而不是只重画侧栏：1v1 的 rail 宽度与列数
+     都由这些开关决定（开了才放宽到两列），只重画卡片会留下错位的几何。 */
+  window.addEventListener('ctrl-supers', function () { relayoutAndRender(); });
 
   /* R13 光标指示器：游戏是自绘光标（画在游戏画面里，位于覆盖层之下），
      移到不透明面板上就"消失"。exe 侧 /cursor/sse 推全局光标的覆盖层坐标，

@@ -34,6 +34,27 @@
     try { window.dispatchEvent(new CustomEvent('ctrl-units')); } catch (e) {}
   }
 
+  /* R29 支援技能自定义：开关 + 优先顺序 + 隐藏名单，解析成 __SUPER_CUSTOM。
+     这三项都是**超武节名**（NukeSpecial…），与上面的 __UNIT_CUSTOM（HTNK…）
+     完全分离 —— 两套清单各管各的，不要混用。
+     内容有变化才派发 ctrl-supers，由 demo.js 重排一次（不必每 1.5s 重渲染）。 */
+  var lastSuper = null;
+  function applySuperCustom() {
+    var prio = null, hid = null;
+    try { prio = CTRL.super_priority ? JSON.parse(CTRL.super_priority) : null; } catch (e) {}
+    try { hid = CTRL.hidden_supers ? JSON.parse(CTRL.hidden_supers) : null; } catch (e) {}
+    if (!Array.isArray(prio) || !prio.length) prio = null;
+    if (!Array.isArray(hid) || !hid.length) hid = null;
+    var on = !!CTRL.show_supers;
+    var cur = JSON.stringify([on, prio, hid]);
+    if (cur === lastSuper) return;
+    lastSuper = cur;
+    window.__SUPER_CUSTOM = (prio || hid) ? { prio: prio, hid: hid } : null;
+    window.__CTRL_STATE = window.__CTRL_STATE || {};
+    window.__CTRL_STATE.show_supers = on;
+    try { window.dispatchEvent(new CustomEvent('ctrl-supers')); } catch (e) {}
+  }
+
   function apply() {
     if (!CTRL) return;
     var railChk = document.getElementById('railChk');
@@ -61,7 +82,10 @@
        非 boolean（老控制台不传该键）→ 开，与默认值一致。 */
     var hideOnMenu = CTRL.hide_queue_on_menu !== false;
     var changed = !window.__CTRL_STATE || window.__CTRL_STATE.hide_queue_on_menu !== hideOnMenu;
-    window.__CTRL_STATE = { hide_queue_on_menu: hideOnMenu };
+    /* 合并而不是整体替换：show_supers 等键也挂在同一个对象上，
+       整体赋值会把它们抹掉（applySuperCustom 变化时会早退，补不回来）。 */
+    window.__CTRL_STATE = window.__CTRL_STATE || {};
+    window.__CTRL_STATE.hide_queue_on_menu = hideOnMenu;
     if (changed) {
       try { window.dispatchEvent(new CustomEvent('ctrl-queue-hide')); } catch (e) {}
     }
@@ -75,6 +99,7 @@
       try { window.dispatchEvent(new CustomEvent('ctrl-yield')); } catch (e) {}
     }
     applyUnitCustom();
+    applySuperCustom();
   }
 
   window.__ctrlPatch = function (m) {

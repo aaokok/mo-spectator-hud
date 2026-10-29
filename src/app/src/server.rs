@@ -281,6 +281,16 @@ async fn append_probe(st: &Arc<AppState>, err: bool, body: &[u8]) -> Response {
     if !line.ends_with('\n') {
         line.push('\n');
     }
+    // 前端异常同时进运行日志：控制台「日志」页可直接看到，不用去翻文件
+    if err {
+        st.log(format!("[ui] {}", line.trim()));
+    }
+    // 轮转与运行日志同一口径：前端异常现在是常开上报，无上限会写满磁盘
+    if let Ok(m) = tokio::fs::metadata(&p).await {
+        if m.len() > 2 * 1024 * 1024 {
+            let _ = tokio::fs::rename(&p, p.with_extension("log.1")).await;
+        }
+    }
     if let Ok(mut f) = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -312,7 +322,7 @@ async fn control_set(
         let snap = ctrl.clone();
         drop(ctrl);
         st.log(format!(
-            "控制状态更新: show_score={} show_units={} show_queues={} gate={} name={:?} {}:{} mode={:?} yield_tl={} hide_blur={} ovr={}B hid={}B tags={}B cmode={:?} cursor_ind={} prio={:?} wait_hint={} hide_q_menu={} cursor_covered_only={}",
+            "控制状态更新: show_score={} show_units={} show_queues={} gate={} name={:?} {}:{} mode={:?} yield_tl={} hide_blur={} ovr={}B hid={}B tags={}B cmode={:?} cursor_ind={} prio={:?} wait_hint={} hide_q_menu={} cursor_covered_only={} supers={} sprio={} shid={}B",
             snap.show_score,
             snap.show_units,
             snap.show_queues,
@@ -331,7 +341,10 @@ async fn control_set(
             snap.unit_priority,
             snap.show_wait_hint,
             snap.hide_queue_on_menu,
-            snap.cursor_only_when_covered
+            snap.cursor_only_when_covered,
+            snap.show_supers,
+            snap.super_priority,
+            snap.hidden_supers.len()
         ));
         (StatusCode::OK, no_store(), Json(snap)).into_response()
     }
@@ -415,6 +428,22 @@ fn apply_form(ctrl: &mut CtrlState, form: &HashMap<String, String>) {
     if let Some(v) = form.get("unit_priority") {
         if crate::config::valid_priority_json(v) {
             ctrl.unit_priority = v.clone();
+        }
+    }
+    // R29 支援技能：开关 + 两个超武节名列表（与单位的两组字段完全分离）
+    if let Some(v) = form.get("show_supers") {
+        if truthy(v) || falsy(v) {
+            ctrl.show_supers = truthy(v);
+        }
+    }
+    for (key, dst) in [
+        ("super_priority", &mut ctrl.super_priority),
+        ("hidden_supers", &mut ctrl.hidden_supers),
+    ] {
+        if let Some(v) = form.get(key) {
+            if crate::config::valid_string_array_json(v) {
+                *dst = v.clone();
+            }
         }
     }
     // R22：两个 UI 行为开关（等待提示 / Esc 菜单隐藏队列）
