@@ -284,6 +284,23 @@
     { key: 'aircraft', label: '飞机', short: '空' }
   ];
 
+  /* ---- 偷科技（Stolen Tech）四对索引 ----
+     Ares 的 Prerequisite.StolenTechs 是 AND：(StolenTech & Required) == Required。
+     MO 每条产物都要「科技中心 + 建造场」两跳（1+11 / 2+12 / 3+13 / 4+14），
+     所以一格 = 一个阵营的**一对**索引，不是一栋建筑。
+     索引来源：mo3399_rules.ini 里 SpyEffect.StolenTechIndex，共 12 个授予者：
+       1=GATECH 2=NATEK/NATECHC/NATECHR 3=YATECH 4=FACLDP
+       11=GACNST 12=NACNST 13=YACNST 14=FACNST（31=YACXST/YATXCH 无产物，不显示）
+     label 用「尤」而不是「厄普西隆」：168px 侧栏下 4 格每格仅 34px，
+     4 个字会把字号逼到 7px；压到 2 字后能上 12px。tooltip 里仍给全名。 */
+  var TECH_PAIRS = [
+    { cIdx: 1,  yIdx: 11, side: 'allied',  label: '盟军', ab2: '盟军', short: '盟', full: '盟军' },
+    { cIdx: 2,  yIdx: 12, side: 'soviet',  label: '苏军', ab2: '苏军', short: '苏', full: '苏军' },
+    { cIdx: 3,  yIdx: 13, side: 'epsilon', label: '尤',   ab2: '尤里', short: '尤', full: '厄普西隆' },
+    { cIdx: 4,  yIdx: 14, side: 'foehn',   label: '焚风', ab2: '焚风', short: '焚', full: '焚风' }
+  ];
+  var SIDE_COLOR = { allied: '#5aa9e6', soviet: '#e0574f', epsilon: '#a878e8', foehn: '#48c9a0' };
+
   /* 兵营/重工被渗透（bridge: infiltration.barracks / war_factory）后，
      新生产的步兵 / 载具直接老兵——队列图标换 AltCameo（*uico）。
      MO 3.3.6 里只有兵营（Factory=InfantryType）和重工（Factory=UnitType）
@@ -358,6 +375,16 @@
     if (key === 'vehicle') return !!inf.war_factory;
     return false;
   }
+
+  /* 老兵徽标的两半。bridge 的 infiltration 里 barracks / war_factory 是两个独立位
+     （HouseClass+0x2BF / +0x2C0），Ares 按被渗透建筑的 Factory= 类型分派：
+     兵营（Factory=InfantryType）写兵营位，重工（Factory=UnitType）写重工位。
+     用「兵 / 重」两个字而不是「步 / 载」：队列格左上角的通道标签已经占了 步/载，
+     同字会让人以为是通道状态；「兵营 / 重工」也是玩家自己的叫法。 */
+  var VET_MARKS = [
+    { key: 'barracks',    text: '兵', title: '兵营被渗透：新造步兵直接老兵' },
+    { key: 'war_factory', text: '重', title: '重工被渗透：新造载具直接老兵' }
+  ];
 
   /* power[0]=产出/上限, power[1]=消耗/已用 */
   function powerOf(p) {
@@ -620,14 +647,33 @@
      小到 MIN 还放不下才减列。参数全部落在 state 上，CSS 通过 --qc-w 等
      变量消费，所以以后要改布局（改成 4 列、加边框、换间距）只动这里。 */
   /* 单格基准尺寸（原版 cameo 60×48）。要改布局形状，改这几个常量即可：
-     Q_COLS_PREF 决定优先保几列；Q_MIN_W 决定缩到多小才放弃这个列数。 */
+     Q_MIN_W 决定缩到多小才放弃这个列数。 */
   var Q_FULL_W = 60, Q_FULL_H = 48;
   var Q_MIN_W = 32;              /* 再小图标就认不出，宁可减列 */
   var Q_GAP = 3;                 /* 格子间距，也是 .qgrid 的 margin-top */
   var Q_PAD_X = 16;              /* .qpanel 左右内边距 + 边框 + 余量 */
   var Q_CHANNELS = 6;            /* building/defense/infantry/vehicle/navy/aircraft */
-  /* 列数候选：从"原版形状"往下降。加 4 列之类的新布局，改这个数组即可。 */
-  var Q_COL_CANDIDATES = [3, 2, 1];
+
+  /* 列数按人数切换（2026-10-30）。
+     动机：168 px 侧栏下 3 列只能排到 48×38，图标被压得看不清；2 列能回到原版 60×48。
+     代价：6 条通道从 2 行变 3 行，每个玩家面板多占 71 px。
+     实测（列高 898、方案 A 含渗透条，见 P1-6 报告 §10.8）：
+     1v1 余 471 / 2v2 余 41 / 3v3 缺 389 / 4v4 缺 819。
+     所以只有 ≤2v2 负担得起 2 列；3v3 起必须回 3 列，否则 1/3 的玩家面板看不到。
+
+     但这不是硬性规定：只有「3 列真的排不满 Q_FULL_W」时才值得换 2 列。
+     1600×900 及更宽的侧栏（202/252 px）下 3 列本来就能排满 60×48，
+     此时换 2 列只会白多一行、还把格子从 60 撑到 60（无收益），必须按宽度否决。 */
+  var Q_COLS_BY_SIZE = { 1: [2, 1], 2: [2, 1], 3: [3, 2, 1], 4: [3, 2, 1] };
+
+  function queueColCandidates(avail) {
+    var n = Math.max(1, Math.min(4, state.perTeam || 3));
+    var base = Q_COLS_BY_SIZE[n] || [3, 2, 1];
+    if (base[0] !== 2) return base;
+    /* 2 列候选只在 3 列装不下满格时才启用 */
+    var fit3 = Math.floor((avail - 2 * Q_GAP) / 3);
+    return fit3 >= Q_FULL_W ? [3, 2, 1] : base;
+  }
 
   /* 按可用宽度推导格子尺寸与列数。
      策略：从最想要的列数开始试，能放下就等比缩小格子（不轻易减列，
@@ -636,9 +682,10 @@
   function applyQueueGeometry(qW) {
     var avail = Math.max(0, (qW || 0) - Q_PAD_X);
     var cols = 1, cellW = Q_MIN_W;
+    var cands = queueColCandidates(avail);
 
-    for (var i = 0; i < Q_COL_CANDIDATES.length; i++) {
-      var c = Q_COL_CANDIDATES[i];
+    for (var i = 0; i < cands.length; i++) {
+      var c = cands[i];
       var gapTotal = (c - 1) * Q_GAP;
       var fit = Math.floor((avail - gapTotal) / c);
       if (fit >= Q_MIN_W) {
@@ -649,7 +696,7 @@
       }
       /* 最后一个候选也放不下：用最少的列数 + 最小格子兜底，
          宁可轻微溢出（overflow-x 已锁 hidden）也不让面板完全没格 */
-      if (i === Q_COL_CANDIDATES.length - 1) {
+      if (i === cands.length - 1) {
         cols = c;
         cellW = Q_MIN_W;
       }
@@ -695,6 +742,22 @@
       '--qc-uid-fs': uidFs + 'px',
       '--qc-badge-min': badgeMin + 'px'
     };
+    /* 渗透框几何（v6.7）：4 格铺满面板内可用宽，字号按「最长标签能否放下」反推。
+       不用系数估——「尤」把最长标签压到 2 字后，系数法会留下大片空白。
+       上界 12px：再大格高会顶穿 3v3 的纵向预算。 */
+    var stripAvail = Math.max(0, (state.queueW || 168) - Q_PAD_X - 4);
+    var fcCellW = Math.floor((stripAvail - 3 * 3) / 4);
+    var fcTextW = fcCellW - 6;                 /* 内边距 1+1、左缘色条 2、边框 2 */
+    var fcFs = 7;
+    for (var tfs = 12; tfs >= 7; tfs--) {
+      if (textWidthPx('焚风', tfs) <= fcTextW) { fcFs = tfs; break; }
+    }
+    vars['--fc-cols'] = '4';
+    vars['--fc-gap'] = '3px';
+    vars['--fc-h'] = (fcFs + 8) + 'px';
+    vars['--fc-fs'] = fcFs + 'px';
+    vars['--fc-textw'] = fcTextW + 'px';
+    vars['--fc-pf'] = '4px';
     for (var k2 in vars) col.style.setProperty(k2, vars[k2]);
   }
 
@@ -1143,6 +1206,69 @@
     '</div>';
   }
 
+  /* ---- 渗透框（2v2 及以下才渲染） ----
+     四格 = 四个阵营的偷科技门槛，格内写阵营名，底部两段 pip：
+       左 = 科技中心（cIdx），右 = 建造场（yIdx）。
+     三态：none 未渗透 / half 只偷到一半 / done 整对完成（该阵营产物可造）。
+     done 用绿色，和技能栏就绪同一套语义；half 用橙色表示还差一次。 */
+  function techPairState(mask, pair) {
+    var c = (mask & (1 << pair.cIdx)) !== 0;
+    var y = (mask & (1 << pair.yIdx)) !== 0;
+    return { c: c, y: y, done: c && y, any: c || y };
+  }
+
+  function techStripHtml(p) {
+    var inf = p.infiltration || {};
+    /* 读不到账本（没装 Ares / 该房无 ExtData）时给中性提示，
+       不要画成「四格全灭」——那会被读成「这局没人渗透」。 */
+    if (!inf.stolen_tech_ok) {
+      return '<div class="fwrap fwrap-na" title="未读到 Ares 偷科技账本">' +
+        '<div class="fcap">渗透</div>' +
+        '<div class="fna">—</div></div>';
+    }
+    var mask = inf.stolen_tech >>> 0;
+    var cells = '', segs = '', anyDone = false;
+    for (var i = 0; i < TECH_PAIRS.length; i++) {
+      var pr = TECH_PAIRS[i];
+      var st = techPairState(mask, pr);
+      if (st.done) anyDone = true;
+      var cls = 'fcell ' + (st.done ? 'done' : (st.any ? 'half' : 'none'));
+      var tip = pr.full + '\n' +
+        '科技中心 ' + (st.c ? '已渗透' : '未渗透') + '（索引 ' + pr.cIdx + '）\n' +
+        '建造场 ' + (st.y ? '已渗透' : '未渗透') + '（索引 ' + pr.yIdx + '）\n' +
+        (st.done ? '→ 该阵营偷科技产物已解锁' : (st.any ? '→ 还差一次渗透' : '→ 未渗透'));
+      cells += '<div class="' + cls + '" style="--fc-col:' + SIDE_COLOR[pr.side] +
+        '" title="' + esc(tip) + '">' +
+        '<span class="fl">' + displayLabel(pr) + '</span>' +
+        '<span class="fp"><i class="' + (st.c ? 'on' : '') + '"></i>' +
+        '<i class="' + (st.y ? 'on' : '') + '"></i></span></div>';
+      segs += '<i class="' + (st.done ? 'on' : '') + '"></i>';
+    }
+    return '<div class="fwrap' + (anyDone ? ' hasdone' : '') + '">' +
+      '<div class="fcap">渗透<span class="fseg">' + segs + '</span></div>' +
+      '<div class="fcells" style="--fc-cols:' + TECH_PAIRS.length + '">' + cells + '</div></div>';
+  }
+
+  /* 格内文字按可用宽度逐格降级：全名 → 2 字 → 单字。
+     宽度用 canvas 实测，不用「字数 × 字号」估（中文 1em/字，但混排会算错）。 */
+  var _twCache = {};
+  function textWidthPx(txt, fs) {
+    var key = fs + '|' + txt;
+    if (_twCache[key] != null) return _twCache[key];
+    var cv = textWidthPx._cv || (textWidthPx._cv = document.createElement('canvas'));
+    cv.getContext('2d').font = '700 ' + fs + 'px "Microsoft YaHei", sans-serif';
+    var w = cv.getContext('2d').measureText(txt).width;
+    _twCache[key] = w;
+    return w;
+  }
+  function displayLabel(pr) {
+    var fs = parseInt(document.documentElement.style.getPropertyValue('--fc-fs'), 10) || 9;
+    var avail = parseInt(document.documentElement.style.getPropertyValue('--fc-textw'), 10) || 28;
+    if (textWidthPx(pr.label, fs) <= avail) return pr.label;
+    if (textWidthPx(pr.ab2, fs) <= avail) return pr.ab2;
+    return pr.short;
+  }
+
   /* 只生成外壳（格子留空），内容统一由 updateQueuePanel 的键控补丁填充 */
   function queuePanelHtml(p, cols) {
     return '<div class="qpanel' + (p.queues ? '' : ' na') +
@@ -1151,8 +1277,10 @@
       '<div class="qhead">' +
         '<span class="qteam">' + esc(p._team) + '</span>' +
         '<span class="qtitle">' + esc(p.name) + '</span>' +
-        '<span class="qcount"></span>' +
       '</div>' +
+      /* 渗透框在队列**上方**：队列是视线最常停留的地方，
+         压在它上面等于每看一次队列就顺带扫到一次渗透。 */
+      '<div class="fslot"></div>' +
       '<div class="qgrid" style="grid-template-columns:repeat(' + cols + ',var(--qc-w,60px))"></div>' +
     '</div>';
   }
@@ -1172,26 +1300,55 @@
     var want = 'repeat(' + cols + ',var(--qc-w,60px))';
     if (grid.style.gridTemplateColumns !== want) grid.style.gridTemplateColumns = want;
 
-    /* VET 徽标按渗透状态原位增删，不重建整卡 */
-    var vetEl = panel.querySelector('.qvet');
-    var wantVet = !!(p.infiltration &&
-      (p.infiltration.barracks || p.infiltration.war_factory));
-    if (wantVet && !vetEl) {
-      var v = elFromHtml('<span class="qvet" title="兵营/重工被渗透：新造单位直接老兵">VET</span>');
-      var head = panel.querySelector('.qhead');
-      head.insertBefore(v, panel.querySelector('.qcount'));
-    } else if (!wantVet && vetEl) {
-      vetEl.remove();
-    }
+    /* 老兵徽标按渗透状态原位增删，不重建整卡。
+       bridge 给的是两个**独立**位（infiltration.barracks / war_factory，
+       对应 HouseClass+0x2BF / +0x2C0），原来合成一个 VET 会把
+       「只渗透了兵营」和「只渗透了重工」显示成同一个样子——
+       观战方看不出新造的是步兵老兵还是载具老兵。拆成两个单字徽标。 */
+    VET_MARKS.forEach(function (mark) {
+      var el = panel.querySelector('.qvet[data-vet="' + mark.key + '"]');
+      var want = !!(p.infiltration && p.infiltration[mark.key]);
+      if (want && !el) {
+        var v = elFromHtml('<span class="qvet" data-vet="' + mark.key +
+          '" title="' + mark.title + '">' + mark.text + '</span>');
+        var head = panel.querySelector('.qhead');
+        head.appendChild(v);
+      } else if (!want && el) {
+        el.remove();
+      }
+    });
 
     var busy = 0;
     CHANNELS.forEach(function (ch) {
       var q = p.queues && p.queues[ch.key];
       if (q && q.id) busy++;
     });
-    var count = panel.querySelector('.qcount');
-    var countText = p.queues ? busy + '/' + CHANNELS.length : '未接入';
-    if (count && count.textContent !== countText) count.textContent = countText;
+    /* 队头不再显示「n/6」。格子本身已经是「有图标 = 在生产」，
+       数字只是在挤玩家名字。busy 仍算出来供 title 与调试用。 */
+    panel.dataset.busy = p.queues ? busy : '';
+
+    /* 渗透框：只有 ≤2v2 才渲染。3v3/4v4 纵向余量不够，
+       只保留队头的兵/重徽标（用户 2026-10-31 决定）。
+       用 _showTechStrip 而不是直接读 perTeam，是为了 mock 下也能对照。 */
+    var slot = panel.querySelector('.fslot');
+    if (slot) {
+      var wantStrip = state.perTeam <= 2;
+      var cur = slot.firstChild;
+      var hasStrip = !!(cur && cur.className && cur.className.indexOf('fwrap') === 0);
+      if (wantStrip && !hasStrip) {
+        slot.innerHTML = techStripHtml(p);
+      } else if (!wantStrip && hasStrip) {
+        slot.innerHTML = '';
+      } else if (wantStrip && hasStrip) {
+        /* 已存在就只在账本变化时重建——每帧重画 canvas 量宽太浪费 */
+        var sig = (p.infiltration && p.infiltration.stolen_tech || 0) + '|' +
+          (p.infiltration && p.infiltration.stolen_tech_ok ? 1 : 0);
+        if (slot.dataset.sig !== sig) {
+          slot.innerHTML = techStripHtml(p);
+          slot.dataset.sig = sig;
+        }
+      }
+    }
 
     patchChildren(grid, CHANNELS,
       function (ch) { return ch.key; },

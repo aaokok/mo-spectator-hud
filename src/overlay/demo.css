@@ -1251,13 +1251,8 @@ body.paused .paused-badge { display: inline-block; }
   min-width: 0;
 }
 
-.qcount {
-  margin-left: auto;
-  flex: none;
-  color: #93a4b8;
-  font: 10px Consolas, monospace;
-  white-space: nowrap;
-}
+/* .qcount 已移除：队头网格里有图标本身就表示「在造」，
+   再叠一个 5/6 只会挤压玩家名。busy 计数改为 panel.dataset.busy 仅供调试。 */
 
 /* 格子几何全部走 CSS 变量（由 demo.js 的 applyQueueGeometry 写入）：
    侧栏窄的时候整体缩小图标，而不是减列。
@@ -1418,16 +1413,109 @@ body.paused .paused-badge { display: inline-block; }
   transition: width .4s ease;
 }
 
-/* 兵营/重工被渗透：新造单位直接老兵 */
+/* 老兵：兵营 / 重工被渗透，新造单位直接老兵。
+   两个独立单字徽标（兵 / 重），不再合成一个 VET——
+   合成后会丢掉「哪一个被渗透」这个信息。
+   单字宽度约 13px，两个同时亮也只有 28px，比原来的 VET 徽标还窄。 */
 .qvet {
   margin-left: 2px;
-  padding: 0 4px;
+  padding: 0 2px;
+  min-width: 13px;
+  text-align: center;
   border: 1px solid rgba(255, 209, 102, .6);
   border-radius: 3px;
   color: #ffd166;
-  font: 700 9px/13px Consolas, monospace;
-  letter-spacing: .04em;
+  font: 700 9px/13px "Microsoft YaHei", sans-serif;
 }
+
+/* ------------------------------------------------ 渗透框（v6.7，仅 ≤2v2）
+   4 格框成一块，左上写「渗透」——不然 4 个裸格子紧贴队列会读成「第 2 行队列」。
+   外框不额外占横向空间（4 格本就铺满面板内宽），只多 1px 边 + 11px 标题行。 */
+.fwrap {
+  margin: 0 0 var(--qc-gap, 3px);
+  padding: 2px 2px 3px;
+  border: 1px solid rgba(255, 209, 102, .30);
+  border-radius: 5px;
+  background: linear-gradient(0deg, rgba(255, 209, 102, .07), rgba(255, 209, 102, .02));
+}
+/* 任一阵营凑满一对 → 外框转绿。绿=可造，与技能栏就绪同一套语义。 */
+.fwrap.hasdone {
+  border-color: rgba(94, 224, 138, .55);
+  background: linear-gradient(0deg, rgba(94, 224, 138, .09), rgba(94, 224, 138, .02));
+}
+.fwrap .fcap {
+  display: flex; align-items: center; gap: 3px;
+  height: 11px; margin: 0 0 2px;
+  font: 700 9px/11px "Microsoft YaHei", sans-serif;
+  color: #d8b264; letter-spacing: .06em;
+}
+.fwrap.hasdone .fcap { color: #8fe0a8; }
+/* 标题右侧 4 段：标出**哪几个**阵营完成了，比「渗 n」多一层信息 */
+.fwrap .fseg { display: flex; gap: 2px; margin-left: auto; }
+.fwrap .fseg i { width: 5px; height: 5px; border-radius: 1px; background: rgba(255, 255, 255, .13); }
+.fwrap .fseg i.on { background: #5ee08a; }
+/* 账本读不到（没装 Ares / 无 ExtData）时的中性占位。
+   不能画成四格全灭——那会被读成「这局没人渗透」。 */
+.fwrap .fna {
+  display: grid; place-items: center;
+  height: calc(var(--fc-h, 20px) + 2px);
+  border: 1px dashed rgba(255, 255, 255, .12); border-radius: 3px;
+  background: rgba(3, 5, 8, .35);
+  color: #4d5a68; font: 700 9px/1 "Microsoft YaHei", sans-serif;
+}
+.fcells {
+  display: grid;
+  grid-template-columns: repeat(var(--fc-cols, 4), minmax(0, 1fr));
+  gap: var(--fc-gap, 3px);
+}
+.fcell {
+  position: relative; display: flex; align-items: stretch;
+  height: var(--fc-h, 20px); min-width: 0; overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, .14); border-radius: 3px;
+  background: rgba(3, 5, 8, .6);
+}
+.fcell .fl {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0 1px 4px; overflow: hidden;
+  font: 700 var(--fc-fs, 9px)/1 "Microsoft YaHei", sans-serif;
+  color: #6f7f90; white-space: nowrap; text-overflow: ellipsis;
+}
+/* 底部两段 pip：左 = 科技中心，右 = 建造场。横铺而不是两个并排方块，
+   因为 34px 的格宽里两个方块要吃掉 21px，横向空间不够。 */
+.fcell .fp {
+  position: absolute; left: 2px; right: 2px; bottom: 0;
+  height: var(--fc-pf, 4px); display: flex; gap: 2px;
+}
+.fcell .fp i { flex: 1; border-radius: 1px; background: rgba(255, 255, 255, .12); }
+/* pip 亮色不跟阵营色：阵营由左缘色条表达，pip 只表达「这一跳偷到没有」 */
+.fcell .fp i.on { background: #ffd166; }
+/* 左缘阵营色条 */
+.fcell::before {
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 2px;
+  background: var(--fc-col, #ffd166); opacity: .5;
+}
+/* 三态。done 用绿（用户要求「渗透两个完毕后显示为绿色」），
+   half 用橙表示还差一次——原来的 .55 透明在暗底上几乎看不见，已提到 .95。 */
+.fcell.none { border-style: dashed; border-color: rgba(255, 255, 255, .10); }
+.fcell.none .fl { color: #5a6875; }
+.fcell.none::before { opacity: .16; }
+.fcell.half {
+  border-color: rgba(255, 170, 60, .95);
+  background: rgba(48, 30, 4, .7);
+  box-shadow: inset 0 0 0 1px rgba(255, 170, 60, .22);
+}
+.fcell.half .fl { color: #ffcf8a; }
+.fcell.half .fp i.on { background: #ffaa3c; }
+.fcell.half::before { opacity: .75; }
+.fcell.done {
+  border-color: #5ee08a;
+  background: rgba(8, 42, 22, .78);
+  box-shadow: inset 0 0 0 1px rgba(94, 224, 138, .30), 0 0 7px rgba(80, 220, 130, .30);
+}
+.fcell.done .fl { color: #b6f7c8; }
+.fcell.done .fp i.on { background: #5ee08a; }
+.fcell.done::before { opacity: 1; }
 
 /* ---------------------------------------------------------------- blocked */
 

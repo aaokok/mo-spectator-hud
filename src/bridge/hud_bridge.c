@@ -287,6 +287,16 @@
 #define H_WHO_LAST_HURT_ME   0x548C
 #define H_POWER_SURPLUS      0x160B4
 
+/* Ares 偷科技账本（v6.7）。
+   YRpp 把 +0x16084 叫 unknown_16084 —— 原版未使用的字段，Ares 借它挂
+   HouseExt::ExtData*。ExtData+0x40 是 std::bitset<32> 的 StolenTech，
+   Ares 把 BuildingTypeExt::ExtData::StolenTechIndex 预编译出的位掩码
+   OR 进去（Ares.dll 0x100121CA）。
+   读法：HouseClass+0x16084 → ExtData* → ExtData+0x40 取 4 字节。
+   两次读都要验指针，否则会把野内存当掩码。 */
+#define H_ARES_EXT_DATA      0x16084
+#define ARES_EXT_STOLEN_TECH 0x00040
+
 /* BaseClass */
 #define B_PERCENT_BUILT      0x001C
 #define B_CENTER             0x0050
@@ -411,6 +421,33 @@ static int rd_i32(DWORD a, int *v)   { return rd(a, v, 4); }
 static int rd_u8 (DWORD a, BYTE *v)  { return rd(a, v, 1); }
 static int rd_i16(DWORD a, int *v)   { short s = 0; int r = rd(a, &s, 2); *v = s; return r; }
 static int rd_f32(DWORD a, float *v) { return rd(a, v, 4); }
+
+/* 指针是否落在本进程可读区域内。
+   读 ExtData 这类二级指针必须验：ExtData 可能尚未创建（Ares 只对
+   已有扩展数据的房子分配），悬空或野值直接 ReadProcessMemory 会失败，
+   但如果恰好落在某个可读页里就会读到垃圾并当成掩码输出。 */
+static int ptr_ok(DWORD p)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!p) return 0;
+    if (!VirtualQueryEx(g_proc, (LPCVOID)(ULONG_PTR)p, &mbi, sizeof(mbi))) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    return 1;
+}
+
+/* 读 Ares 的 StolenTech 32 位账本。
+   返回 1 成功（*mask 有值），0 表示这局没装 Ares 或该房还没有 ExtData。
+   调用方不能把 0 当成「没渗透」——它是「读不到」，渲染端要区别对待。 */
+static int read_stolen_tech(DWORD hp, DWORD *mask)
+{
+    DWORD ext = 0;
+    *mask = 0;
+    if (!rd_u32(hp + H_ARES_EXT_DATA, &ext) || !ext) return 0;
+    if (!ptr_ok(ext)) return 0;
+    if (!rd_u32(ext + ARES_EXT_STOLEN_TECH, mask)) return 0;
+    return 1;
+}
 /* 读 4 个 int32 的 RectangleStruct；失败返回 0（数组保持原样） */
 static int rd_rect(DWORD a, int *out)
 {
@@ -585,10 +622,32 @@ static const char *install_dir(void)
     return buf;
 }
 
+/* 读 spawn.ini 的 StolenTech= 开关（v6.7）。
+   为什么必须读文件：Ares 只在 StolenTech=True 时才合并 Stolen Tech.ini，
+   关掉后 11 个科技建筑全部回落 Spyable=no —— 也就是「渗透事件根本不会发生」，
+   而不是「偷了但没解锁」。只看掩码为 0 无法区分这两种状态，
+   渲染端会误导观众以为「这局没人渗透」。
+   返回 1=读到且为 true，0=读到 false 或读不到（读不到按关闭处理，宁可不显示）。 */
+static int read_stolentech_option(void)
+{
+    char ini[MAX_PATH], buf[32];
+    const char *dir = install_dir();
+    if (!dir || !dir[0]) return 0;
+    _snprintf(ini, sizeof(ini), "%s/spawn.ini", dir);
+    ini[sizeof(ini) - 1] = 0;
+    buf[0] = 0;
+    GetPrivateProfileStringA("Settings", "StolenTech", "", buf, sizeof(buf), ini);
+    /* MO 的 spawn.ini 里该键在 [Settings] 段；键名大小写不敏感，值可能是 True/yes/1 */
+    if (!buf[0]) {
+        GetPrivateProfileStringA(NULL, "StolenTech", "", buf, sizeof(buf), ini);
+    }
+    if (!buf[0]) return 0;
+    return (!_stricmp(buf, "true") || !_stricmp(buf, "yes") || !strcmp(buf, "1")) ? 1 : 0;
+}
+
 /* 该 pid 的 exe 全路径是否位于 MO 安装目录下。读不到路径就当"不是"。 */
 static int proc_in_install_dir(DWORD pid)
-{
-    const char *dir = install_dir();
+{    const char *dir = install_dir();
     HANDLE h;
     char path[MAX_PATH];
     DWORD n = MAX_PATH;
@@ -799,6 +858,8 @@ struct PlayerRec {
     int   spied, thieved;
     int   inf_side0, inf_side1, inf_side2;    /* 渗透敌方阵营：解锁对应偷科技条目 */
     int   inf_barracks, inf_warfactory;       /* 渗透过敌方兵营/重工：己方新造单位直接老兵 */
+    DWORD stolen_tech;                        /* Ares StolenTech 32 位账本（v6.7） */
+    int   stolen_tech_ok;                     /* 1=读到真值；0=没装 Ares / 无 ExtData */
     int   cash, spent, harvested, stolen, storage;
     int   power_out, power_drain, power_surplus;
     int   army_inf, army_veh, army_air;
@@ -852,6 +913,7 @@ struct Snap {
     int   menu_open, menu_dialogs, menu_od;
     char  map_name[128], map_uiname[64], map_file[260], session_file[260];
     int   money, speed, ai_players, ai_diff, bases, bridges, crates, shortgame, allies;
+    int   stolen_tech_enabled;                /* spawn.ini 的 StolenTech=（v6.7） */
     int   is_observer, observer_mode;
     int   view_x, view_y, view_zoom_x1000, view_cell_x, view_cell_y;
     int   map_rect[4], world_rect[4], valid_cells;
@@ -1617,6 +1679,8 @@ static void collect(struct Snap *s, int max_supers_per_player)
         rd_u8(A_GAMEMODE_OPTIONS + GO_SHORTGAME, &b); s->shortgame = b;
         rd_u8(A_GAMEMODE_OPTIONS + GO_ALLIES, &b);    s->allies = b;
     }
+    /* v6.7：StealTech 是否开着。非内存字段，读 spawn.ini。 */
+    s->stolen_tech_enabled = read_stolentech_option();
 
     /* 观战标志 */
     {
@@ -1758,6 +1822,13 @@ static void collect(struct Snap *s, int max_supers_per_player)
         rd_u8(hp + H_SIDE2_TECH_INFILTRATED, (BYTE *)&p->inf_side2);
         rd_u8(hp + H_BARRACKS_INFILTRATED, (BYTE *)&p->inf_barracks);
         rd_u8(hp + H_WAR_FACTORY_INFILTRATED, (BYTE *)&p->inf_warfactory);
+
+        /* v6.7：Ares 偷科技账本。原版那 5 个 bool 位（side0/1/2 + 兵营/重工）
+           只说明「渗透过哪个阵营」，不说明「拿到哪几个建筑」——
+           而 MO 的产物门槛是 Prerequisite.StolenTechs=1,11 这种索引对（AND），
+           必须读 Ares 的 32 位账本才能判断半套/整套。 */
+        p->stolen_tech_ok = read_stolen_tech(hp, &p->stolen_tech);
+        if (!p->stolen_tech_ok) p->stolen_tech = 0;
 
         rd_i32(hp + H_BALANCE, &bal);           p->cash = bal;
         rd_i32(hp + H_CREDITS_SPENT, &spent);   p->spent = spent;
@@ -1904,9 +1975,11 @@ static void emit_json(SB *b, const struct Snap *s, DWORD pid)
     sb_add(b, "  \"map_file\": "); sb_json(b, s->map_file); sb_add(b, ",\n");
     sb_add(b, "  \"session_file\": "); sb_json(b, s->session_file); sb_add(b, ",\n");
     sb_printf(b, "  \"options\": {\"money\": %d, \"speed\": %d, \"ai\": %d, \"ai_diff\": %d, "
-                 "\"bases\": %d, \"bridges\": %d, \"crates\": %d, \"shortgame\": %d, \"allies\": %d},\n",
+                 "\"bases\": %d, \"bridges\": %d, \"crates\": %d, \"shortgame\": %d, \"allies\": %d, "
+                 "\"stolen_tech\": %s},\n",
               s->money, s->speed, s->ai_players, s->ai_diff,
-              s->bases, s->bridges, s->crates, s->shortgame, s->allies);
+              s->bases, s->bridges, s->crates, s->shortgame, s->allies,
+              s->stolen_tech_enabled ? "true" : "false");
     sb_printf(b, "  \"observer\": {\"is_observer\": %s, \"observer_mode\": %d},\n",
               s->is_observer ? "true" : "false", s->observer_mode);
     /* v6/P2：聚合表触顶丢弃计数（0=正常） */
@@ -2006,9 +2079,12 @@ static void emit_json(SB *b, const struct Snap *s, DWORD pid)
         /* 渗透收益（v6.2）：inf_barracks/inf_warfactory 为真时，
            该玩家新造步兵/载具直接老兵，渲染端应换 AltCameo 图标 */
         sb_printf(b, "\"infiltration\": {\"side0\": %d, \"side1\": %d, \"side2\": %d, "
-                     "\"barracks\": %d, \"war_factory\": %d}, ",
+                     "\"barracks\": %d, \"war_factory\": %d, "
+                     "\"stolen_tech\": %lu, \"stolen_tech_ok\": %s}, ",
                   p->inf_side0, p->inf_side1, p->inf_side2,
-                  p->inf_barracks, p->inf_warfactory);
+                  p->inf_barracks, p->inf_warfactory,
+                  (unsigned long)p->stolen_tech,
+                  p->stolen_tech_ok ? "true" : "false");
         sb_add(b, "\"supers\": [");
         for (k = 0; k < p->nsupers; ++k) {
             if (k) sb_add(b, ", ");
@@ -2216,7 +2292,13 @@ static int dry_run(const char *out, const char *text)
     s.players[1].has_centroid = 1; s.players[1].cent_x = 60; s.players[1].cent_y = 140;
     s.players[1].cent_bld = 18; s.players[1].spawn_pos = 1;
     s.players[1].defeated = 1;   /* 示例：战败标记 */
-    s.players[1].inf_barracks = 1;   /* 示例：渗透过兵营 → 新造步兵直接老兵 */
+    s.players[1].inf_barracks = 1;   /* 示例：渗透过兵营 → 新造步兵直接戴老兵 */
+    /* v6.7 示例：mask = bit1 + bit11（盟军科技中心 + 盟军建造场）→ 整对完成 */
+    s.players[1].stolen_tech = (1u << 1) | (1u << 11);
+    s.players[1].stolen_tech_ok = 1;
+    /* 半套示例：只有 bit2（苏军科技中心），没有 bit12（建造场） */
+    s.players[0].stolen_tech = (1u << 2);
+    s.players[0].stolen_tech_ok = 1;
     /* 观察者房样例（应被 JSON/文本双双剔除） */
     s.players[2].ptr = 0x3000; s.players[2].index = 5;
     strcpy(s.players[2].name, "<human player>"); strcpy(s.players[2].uiname, "观战者甲");

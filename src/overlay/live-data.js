@@ -165,7 +165,12 @@
       kills: p.kills || 0,
       lost: p.lost || 0,
       score: p.score || 0,
-      infiltration: p.infiltration || { side0: 0, side1: 0, side2: 0, barracks: 0, war_factory: 0 },
+      /* v6.7：stolen_tech 是 Ares 的 32 位账本，未接时 ok=false，
+         渲染端会画「—」而不是四格全灭（避免读成「这局没人渗透」）。 */
+      infiltration: p.infiltration || {
+        side0: 0, side1: 0, side2: 0, barracks: 0, war_factory: 0,
+        stolen_tech: 0, stolen_tech_ok: false
+      },
       flags: p.flags || {},
       base: p.base || null,
       owned: p.owned || null,
