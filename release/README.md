@@ -1,9 +1,7 @@
 # Release 运行与部署目录
 
-> [!WARNING]
-> **本仓库未提供编译版本，如需要请自行编译**。
-
-可按照根目录 [README.md](../README.md) 的指引完成源码编译后，将编译产物与资源组装至本目录，即可享受完全独立的便携免安装运行环境。
+> [!TIP]
+> 本目录为绿色便携免安装运行环境。可直接从 GitHub Releases 下载解压获得，或通过根目录运行 pack.bat 一键自动打包生成。
 
 ---
 
@@ -31,8 +29,8 @@
 
 ```text
 release/
-├── mo_hud.exe              # 自行编译的 Tauri 2 主程序 (来自 src/app/target/release/)
-├── hud_bridge.exe          # 自行编译的数据读取桥 (来自 src/bridge/)
+├── mo_hud.exe              # Tauri 2 客户端主程序
+├── hud_bridge.exe          # 底层数据读取桥 (Win32 C 原生进程)
 ├── demo/                   # 渲染核前端 (复制自 src/overlay/)
 ├── hud/                    # 管理控制台 (复制自 src/console/)
 ├── icons/                  # Cameo 图标库 (复制自 assets/icons/)

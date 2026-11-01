@@ -152,7 +152,7 @@ flowchart TD
 ## <span id="build">🛠️ 源码构建与一键组装</span>
 
 > [!TIP]
-> 本仓库为纯源码开源，**不提供任何预编译二进制成品**。请根据以下步骤完成本地编译与便携包组装：
+> 推荐直接从 [Releases](../../releases) 页面下载预打包好的绿色免安装压缩包（mo-spectator-hud-vX.X.X.zip）解压即用。若需要进行二次开发或自行从源码构建，请参考以下步骤：
 
 ### 1. 编译底层数据桥 (`hud_bridge.exe`)
 - **环境需求**：Visual Studio 2019 / 2022（包含 C++ 桌面开发工作负载，x86 模式）。
@@ -185,8 +185,8 @@ pack.bat
 若需手动组装，标准结构如下：
 ```text
 release/
-├── mo_hud.exe              # 自行编译的主程序 (来自 src/app/target/release/)
-├── hud_bridge.exe          # 自行编译的数据读取桥 (来自 src/bridge/)
+├── mo_hud.exe              # 客户端主程序 (来自 src/app/target/release/ 或 Releases)
+├── hud_bridge.exe          # 底层数据读取桥 (来自 src/bridge/ 或 Releases)
 ├── demo/                   # 渲染核前端 (复制自 src/overlay/)
 ├── hud/                    # 管理控制台前端 (复制自 src/console/)
 ├── icons/                  # Cameo 图标库 (复制自 assets/icons/)
@@ -276,7 +276,7 @@ mo-spectator-hud/
 │   ├── icons_manifest.json  # 图标 ID 与名称映射字典
 │   └── heroes.json          # 英雄口径与专属光效配置
 │
-└── release/                 # 便携运行发布目录 (供自行编译产物放置)
+└── release/                 # 便携运行发布目录 / 绿色免安装运行环境
     ├── README.md            # 发布包组装指引
     └── .gitkeep             # 目录占位保持
 ```
