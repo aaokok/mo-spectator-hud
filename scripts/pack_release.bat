@@ -21,6 +21,10 @@ if not exist "src\bridge\hud_bridge.exe" (
     copy /y "src\bridge\hud_bridge.exe" "%RELEASE_DIR%\hud_bridge.exe" >nul
     echo  - Synced hud_bridge.exe
 )
+if exist "src\bridge\unit_count_rules.default.ini" (
+    copy /y "src\bridge\unit_count_rules.default.ini" "%RELEASE_DIR%\unit_count_rules.default.ini" >nul
+    echo  - Synced unit_count_rules.default.ini
+)
 
 if not exist "src\app\target\release\mo_hud.exe" (
     echo [!] Missing src\app\target\release\mo_hud.exe, please run cargo build --release!

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "MO Spectator HUD",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "identifier": "com.mospectator.hud",
   "build": {
     "frontendDist": "../console"
@@ -20,6 +20,7 @@
       "../overlay": "demo/",
       "../console": "hud/",
       "../bridge/hud_bridge.exe": "hud_bridge.exe",
+      "../bridge/unit_count_rules.default.ini": "unit_count_rules.default.ini",
       "../../assets/icons": "icons/"
     }
   }

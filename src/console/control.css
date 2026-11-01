@@ -632,6 +632,9 @@ kbd {
 .chip:hover { border-color: var(--acc); color: var(--txt); }
 .chip.off { background: rgba(var(--danger-rgb), .11); border-color: rgba(var(--danger-rgb), .36); color: var(--danger-fg); }
 .chip.off::before { content: ""; width: 8px; height: 1.5px; background: currentColor; border-radius: 1px; }
+/* 选中态：单位页的 .off = 「该类已隐藏」，支援技能页的 .on = 「只看这一类」 */
+.chip.on { background: rgba(var(--acc-rgb), .13); border-color: rgba(var(--acc-rgb), .38); color: var(--acc); }
+.chip.on::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
 #page-units.on, #page-logs.on { display: flex; flex-direction: column; height: 100%; }
 #page-units > .card, #page-logs > .card {
   flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; margin-top: 0;
@@ -848,16 +851,33 @@ kbd {
   .statusbar .title { min-width: 0; }
 }
 
-/* ---------------------------------------------------------------- 支援技能页（R29）
-   复用「单位」页的 .urow / .ulist / .ustat / .udetail 骨架，
-   这里只补两个徽标和优先顺序列表。 */
+/* ---------------------------------------------------------------- 支援技能页（R29 / R42）
+   与「单位」页共用 .urow / .ulist / .ustat / .udetail / .chipbar 骨架，
+   这里只补页面自身的 flex 高度、徽标配色和优先顺序列表。
+   R42：改成和单位页一样的「工具栏 + chip 过滤 + 分组列表 + 右侧详情」单卡结构。 */
+#page-supers.on { display: flex; flex-direction: column; height: 100%; }
+#page-supers > .card {
+  flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; margin-top: 0;
+}
+#page-supers > .card > .body { flex: none; }
+/* 开关行下面才是可伸缩的列表区，和单位页 .ulayout 的行为一致 */
+#supersMain { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+#supersMain > .ulayout { flex: 1 1 auto; min-height: 0; }
+@media (max-width: 1000px) { #supersMain > .ulayout { grid-template-rows: minmax(0, 1fr); } }
+
 .bdg.prio { background: rgba(var(--acc-rgb), .14); color: var(--blue-fg); }
+.bdg.pow { background: var(--bdg); color: var(--dim); }
 .swrow.hid .ic { filter: grayscale(1) brightness(.6); opacity: .6; }
 .swrow.hid .id { color: var(--dim); }
 .swrow .actbtn + .actbtn { margin-left: 4px; }
 
-/* 关闭支援技能时把下面的列表压暗，明确"现在不生效" */
-#supersBody.off { opacity: .45; pointer-events: none; }
+/* 关闭支援技能时把下面的列表压暗，明确"现在不生效"（开关本身仍可点） */
+#supersMain.off { opacity: .45; pointer-events: none; }
+
+.ustat .warn, .ustat .warn b { color: var(--warn); }
+
+/* 右侧详情里的优先顺序表：与单位页 .prow 列表同一套密度 */
+#prioList { margin-top: 2px; }
 
 .prow {
   display: flex; align-items: center; gap: 6px;

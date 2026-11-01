@@ -7,6 +7,7 @@ mod envcheck;
 mod follow;
 mod server;
 mod shell;
+mod update;
 mod winutil;
 
 use std::sync::Arc;

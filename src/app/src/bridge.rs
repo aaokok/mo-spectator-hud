@@ -66,6 +66,47 @@ fn kill_ours(state: &std::sync::Arc<AppState>) {
     b.ours = false;
 }
 
+fn init_unit_count_rules(path: &std::path::Path, contents: &[u8]) -> std::io::Result<bool> {
+    use std::io::Write;
+    let temporary = path.with_extension(format!("ini.{}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+    let written = file.write_all(contents).and_then(|_| file.sync_all());
+    drop(file);
+    let result = written.and_then(|_| {
+        // 同卷链接发布完整文件，目标已存在则保留原文件，永不覆盖用户编辑。
+        match std::fs::hard_link(&temporary, path) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(err) => Err(err),
+        }
+    });
+    let cleanup = std::fs::remove_file(&temporary);
+    match (result, cleanup) {
+        (Err(err), _) | (Ok(_), Err(err)) => Err(err),
+        (Ok(created), Ok(())) => Ok(created),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::init_unit_count_rules;
+
+    #[test]
+    fn unit_count_rules_init_preserves_user_edits() {
+        let directory = std::env::temp_dir().join(format!("mo-unit-rules-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("unit_count_rules.ini");
+        assert!(init_unit_count_rules(&path, b"default").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"default");
+        std::fs::write(&path, b"edited").unwrap();
+        assert!(!init_unit_count_rules(&path, b"new template").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"edited");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+}
+
 fn spawn_bridge(state: &std::sync::Arc<AppState>, interval: u32) {
     let exe = state.paths.bridge_exe();
     if !exe.is_file() {
@@ -76,6 +117,17 @@ fn spawn_bridge(state: &std::sync::Arc<AppState>, interval: u32) {
     if let Some(parent) = out.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    let rules = state.paths.unit_count_rules();
+    if !rules.exists() {
+        // 安装包只更新 default 模板；create_new 保证初始化不覆盖已有用户规则。
+        let initial = std::fs::read(state.paths.toolkit_dir.join("unit_count_rules.default.ini"))
+            .unwrap_or_else(|_| include_bytes!("../../bridge/unit_count_rules.default.ini").to_vec());
+        match init_unit_count_rules(&rules, &initial) {
+            Ok(true) => state.log(format!("已初始化单位计数规则: {}", rules.display())),
+            Ok(false) => {}
+            Err(err) => state.log(format!("单位计数规则创建失败: {err}；桥将使用内置默认规则")),
+        }
+    }
     let mut cmd = Command::new(&exe);
     cmd.args([
         "--interval",
@@ -84,6 +136,8 @@ fn spawn_bridge(state: &std::sync::Arc<AppState>, interval: u32) {
         &out.to_string_lossy(),
         "--no-text",
     ])
+    .arg("--unit-count-rules")
+    .arg(&rules)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
     // 桥是控制台程序：不弹黑框

@@ -62,6 +62,7 @@ fn try_bind(port: u16, state: Arc<AppState>) -> Result<(), String> {
         .route("/app/gamepath", post(app_gamepath))
         .route("/app/bridge/restart", post(bridge_restart))
         .route("/app/hotkeys", post(app_hotkeys))
+        .route("/app/update/check", post(app_update_check))
         .route("/{*path}", get(static_file))
         .with_state(state);
 
@@ -528,6 +529,7 @@ async fn app_status(State(st): State<Arc<AppState>>) -> Response {
             "external": bridge.external,
         },
         "game_state": game_state,
+        "version": env!("CARGO_PKG_VERSION"),
     });
     (StatusCode::OK, no_store(), Json(body)).into_response()
 }
@@ -536,6 +538,63 @@ async fn app_log(State(st): State<Arc<AppState>>) -> Response {
     let q = st.log.lock().unwrap();
     let tail: Vec<String> = q.iter().rev().take(200).rev().cloned().collect();
     (StatusCode::OK, no_store(), Json(json!({ "lines": tail }))).into_response()
+}
+
+/// 更新检查：只读 GitHub Release，不下载、不安装。
+/// 30 秒结果缓存避免连点打满未认证限流；网络请求放到阻塞线程，不占用 axum 工作线程。
+static UPDATE_CACHE: std::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>> =
+    std::sync::Mutex::new(None);
+
+async fn app_update_check(State(st): State<Arc<AppState>>) -> Response {
+    const TTL: Duration = Duration::from_secs(30);
+    if let Ok(cache) = UPDATE_CACHE.lock() {
+        if let Some((at, body)) = cache.as_ref() {
+            if at.elapsed() < TTL {
+                return (StatusCode::OK, no_store(), Json(body.clone())).into_response();
+            }
+        }
+    }
+    let result = tokio::task::spawn_blocking(crate::update::fetch_latest).await;
+    let local = env!("CARGO_PKG_VERSION");
+    let body = match result {
+        Ok(Ok(release)) => {
+            let newer = crate::update::is_newer(local, &release.tag);
+            st.log(format!(
+                "更新检查：本地 v{local}，最新 {}（{}）",
+                release.tag,
+                match newer {
+                    Some(true) => "有新版本",
+                    Some(false) => "已是最新",
+                    None => "版本号无法比较",
+                }
+            ));
+            json!({
+                "ok": true,
+                "local": local,
+                "latest": release.tag.trim_start_matches(['v', 'V']),
+                "tag": release.tag,
+                "has_update": newer.unwrap_or(false),
+                "comparable": newer.is_some(),
+                "url": release.url,
+                "published_at": release.published_at,
+                "notes": release.notes,
+                "prerelease": release.prerelease,
+                "asset": release.asset,
+                "error": null,
+            })
+        }
+        Ok(Err(err)) => {
+            st.log(format!("更新检查失败：{err}"));
+            json!({ "ok": false, "local": local, "has_update": false, "error": err })
+        }
+        Err(err) => json!({ "ok": false, "local": local, "has_update": false, "error": format!("检查任务异常：{err}") }),
+    };
+    if body["ok"].as_bool() == Some(true) {
+        if let Ok(mut cache) = UPDATE_CACHE.lock() {
+            *cache = Some((std::time::Instant::now(), body.clone()));
+        }
+    }
+    (StatusCode::OK, no_store(), Json(body)).into_response()
 }
 
 /// R16 `/app/summary`：控制台总览用的轻量对局摘要。

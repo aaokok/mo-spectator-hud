@@ -23,7 +23,7 @@
   <aside class="rail">
     <div class="brand">
       <div class="mark">MO</div>
-      <div class="ver">v0.1.0</div>
+      <div class="ver" id="appVer">v0.1.2</div>
     </div>
     <nav class="nav" id="nav">
       <button data-page="overview" class="on" aria-current="page">
@@ -86,6 +86,10 @@
         <button class="btn" id="btnCopy">
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M15 5H6a2 2 0 0 0-2 2v9"/></svg>
           <span class="btnTxt">复制 OBS 地址</span>
+        </button>
+        <button class="btn" id="btnUpdate" title="检查 GitHub 上的新版本">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v5h-5"/></svg>
+          <span class="btnTxt" id="btnUpdateTxt">检查更新</span>
         </button>
         <button class="btn primary" id="btnHud">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.6"/></svg>
@@ -387,47 +391,57 @@
 
       <!-- ============================ 支援技能 ============================ -->
       <div class="page" id="page-supers">
-        <section class="card" style="margin-top:0">
-          <header>
-            <h2>支援技能栏</h2>
-            <span class="tag">F 方案 · 只影响覆盖层与 OBS</span>
-            <span class="right"><span class="modflag" id="modSupers"><span class="b"></span><span id="modSupersTxt"></span></span></span>
-          </header>
-          <div class="body" id="supersToggle"></div>
-          <div class="body pad" style="border-top:1px solid var(--line)">
-            <div class="hintbox">
-              <b>只在 1v1 生效。</b>开启后 1v1 的玩家面板从单列窄栏改为两列，位置就是「单位」页里
-              单位图标下方的位置——支援技能接在单位格下面，玩家归属天然正确。
-              非 1v1 对局<u>不会</u>插入支援技能，避免多玩家时面板过高。
-              <br><br>
-              <b>与「单位」页不是一回事。</b>单位页管的是 <code>unit_types</code> 里的单位图标
-              （如 <code>HTNK</code>/<code>E1</code>）；这一页管的是超级武器/支援技能
-              （如 <code>NukeSpecial</code>/<code>ForceShieldSpecial</code>）。两边各自独立，互不影响。
-            </div>
-          </div>
-        </section>
-
-        <section class="card" id="supersBody">
+        <section class="card" id="supersBody" style="margin-top:0">
           <div class="toolbar">
-            <input class="search" id="ssearch" placeholder="搜索节名或英文名（如 Nuke / 铁幕）">
+            <input class="search" id="ssearch" placeholder="搜索节名或英文名（如 Nuke / Iron）">
+            <select id="sfSort" aria-label="排序方式">
+              <option value="hud">排序：HUD 显示顺序</option>
+              <option value="group">排序：按条件分组</option>
+              <option value="name">排序：名称 A→Z</option>
+              <option value="rech">排序：充能短→长</option>
+              <option value="rechd">排序：充能长→短</option>
+            </select>
+            <select id="sfState" aria-label="按状态过滤">
+              <option value="">状态：全部</option>
+              <option value="hid">已隐藏</option>
+              <option value="prio">已优先</option>
+              <option value="mod">已修改</option>
+            </select>
             <span class="sp"></span>
-            <span class="modflag" id="supersStatWrap"></span>
+            <span class="modflag" id="modSupers"><span class="b"></span><span id="modSupersTxt"></span></span>
             <button class="btn sm ghost" id="btnSupersReset">恢复默认</button>
           </div>
-          <div class="ulayout">
-            <div>
-              <div class="ulist" id="slist">
-                <div style="padding:20px;color:var(--dim);font-size:12px">支援技能索引未加载（缺 hud/sw-manifest.js）。</div>
+          <div class="body" id="supersToggle"></div>
+          <div id="supersMain">
+            <div class="chipbar" id="sChips"></div>
+            <div class="ulayout">
+              <div>
+                <div class="ulist" id="slist">
+                  <div style="padding:20px;color:var(--dim);font-size:12px">支援技能索引未加载（缺 hud/sw-manifest.js）。</div>
+                </div>
+                <div class="ustat" id="supers-stat"><span><b>—</b> 个支援技能</span></div>
               </div>
-              <div class="ustat" id="supers-stat"><span><b>—</b> 个支援技能</span></div>
+              <aside class="udetail" id="sdetail">
+                <div class="ph">详情</div>
+                <div class="bigic" id="sdIcon"></div>
+                <h3 id="sdName">—</h3>
+                <div class="cls" id="sdId">—</div>
+                <div class="kv"><span>条件</span><span id="sdCond">—</span></div>
+                <div class="kv"><span>充能</span><span id="sdRech">—</span></div>
+                <div class="kv"><span>CSF</span><span id="sdUiname">—</span></div>
+                <div class="kv"><span>显示</span><span id="sdShow">—</span></div>
+                <div class="hintbox" id="sdHint">点击左侧任意技能查看详情。</div>
+                <div class="acts">
+                  <button class="btn sm" id="sdBtnPrio">设为优先</button>
+                  <button class="btn sm" id="sdBtnHide">不显示此技能</button>
+                </div>
+                <div class="subhead"><span>优先显示顺序</span></div>
+                <div class="hintbox" style="margin:0 0 8px">
+                  表里的按表序排在单位格最前面，未列入的按桥输出原序接在后面。
+                </div>
+                <div id="prioList"></div>
+              </aside>
             </div>
-            <aside class="udetail">
-              <div class="ph">优先显示顺序</div>
-              <div class="hintbox" style="margin:0 0 8px">
-                列表顶部的排前面。没列进来的按桥输出原序接在后面。
-              </div>
-              <div id="prioList"></div>
-            </aside>
           </div>
         </section>
       </div>

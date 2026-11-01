@@ -26,4 +26,10 @@ if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxi
 )
 
 :compile
-cl /nologo /MT /O2 hud_bridge.c /Fe:hud_bridge.exe /link psapi.lib winmm.lib advapi32.lib user32.lib
+rem shell32.lib: Unicode command-line paths for unit_count_rules.ini
+cl /nologo /utf-8 /MT /O2 hud_bridge.c /Fe:hud_bridge.exe /link psapi.lib winmm.lib advapi32.lib user32.lib shell32.lib
+if errorlevel 1 (
+    echo BUILD FAILED
+    exit /b 1
+)
+echo BUILD OK

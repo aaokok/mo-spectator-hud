@@ -129,6 +129,11 @@
  *   ⚠ 未实测：三个 drain 超武的 drain_total 是否与游戏内维持时长逐帧吻合（需开局造出
  *     爆裂熔炉/潘多拉枢纽实测）；地图内嵌 ini 改写 ShowCameo 的节认不出来（fail-open）。
  *
+ * v7.3 (2026-11-01)：unit_count_rules.ini 配置化特殊单位计数。
+ *   normal / exclude_loaded / exclude_all；默认不计内载 DRACOD，释放后正常计数。
+ *   原 7 个假载荷移入配置，Spawned 子机过滤保持不变；每秒检查并在帧前整体热更新。
+ *   --check-unit-count-rules 只校验配置，--unit-count-rules 指定 UTF-16 路径。
+ *
  * [TEMP-OBS-GATE-OFF 2026-10-21] 测试期临时禁用观察者判断：
  *   emit_json / emit_text 里"剔除观察者房"的两行用 #if 0 关掉，非观察者也输出全量玩家。
  *   发布前删除两处 #if 0 / #endif 即恢复 v6.1 口径（渲染端若重写需自行按 is_observer_house 过滤）。
@@ -167,6 +172,7 @@
 #include <stdarg.h>
 #include <psapi.h>
 #include <tlhelp32.h>
+#include "unit_count_rules.h"
 
 /* ---- globals (与 hud_probe4.c 一致，均由 offsetof 求出) ---- */
 #define A_HOUSE_ARRAY        0x00A80228u
@@ -929,7 +935,7 @@ struct Snap {
     int   radar_rect[4], radar_view_rect[4], radar_scale_x1000;
     int   nhouses;
     int   uagg_dropped;                       /* 聚合表触顶丢弃的类型数（0=正常） */
-    int   uagg_skipped;                       /* v6.9/R16：子机+载荷占位体被剔除的对象数 */
+    int   uagg_skipped;                       /* Spawned 子机及计数配置排除的对象数 */
     struct PlayerRec players[MAX_HOUSES];
     int   nnode;
     char  node_names[8][64];
@@ -998,29 +1004,10 @@ struct UnitAgg {
 static struct UnitAgg g_uagg[2048];
 static int            g_uagg_n;
 static int            g_uagg_dropped;   /* 聚合表触顶被丢弃的新类型数（顶层 uagg_dropped） */
-static int            g_uagg_skipped;   /* v6.9/R16：被类型层闸剔除的对象数（顶层 uagg_skipped） */
+static int            g_uagg_skipped;   /* Spawned 子机及计数配置排除数（顶层 uagg_skipped） */
 
-/* ---- 载荷占位体（v6.9/R16）：Image=FAKEP 的 InitialPayload 假单位。
- * 它们不是玩家真正拥有的作战单位，混进 unit_types 会让火蜥蜴之类显示成"1 + 4 条"。
- * 刻意不收录：DRACOD（飞蜥炮台，能打能选）、MAGNET（超武投放可见实体）、
- * SLAV（Slave Worker，DontScore 但默认可选）。*/
-static const char *g_dummy[] = {
-    "SALA_1", "SALA_2",     /* 火蜥蜴 SALA 的 4 个混淆载荷 */
-    "SUNB_1",               /* 猎日者 SUNB */
-    "MAGNET_1", "MAGNET_2", /* 磁力束 MAGNET / 鹦鹉螺 NAUT */
-    "CYCL_1",               /* 旋风 CYCL */
-    "F_KSNAK",              /* 巨蟒折跃 F_KSNAK */
-};
-#define DUMMY_N (sizeof(g_dummy) / sizeof(g_dummy[0]))
-
-static int is_dummy_id(const char *id)
-{
-    int i;
-    for (i = 0; i < (int)DUMMY_N; ++i) {
-        if (!strcmp(id, g_dummy[i])) return 1;
-    }
-    return 0;
-}
+/* 特殊单位计数由 unit_count_rules.ini 管理，见 unit_count_rules.h。
+ * 有效配置整表替换：删条目或 normal 都恢复基础统计，不再并行使用 g_dummy。 */
 
 /* ---- 形态归一（v6/D5）：Convert.Deploy 形态对 -> 主形态 ID。全部列出部署形态，
  * 引擎会销毁旧单位+建新形态单位，故按新形态 ID 查表即可归一。规则（用户裁决）：
@@ -1104,8 +1091,8 @@ static void unit_scan_array(DWORD array_addr, DWORD type_off, DWORD *houses, DWO
         id[0] = 0;
         rd_str(type + T_ID, id, sizeof(id));
         if (!id[0]) continue;
-        /* v6.9/R16 闸②：Image=FAKEP 的载荷占位体不计（火蜥蜴等的 InitialPayload 假单位）。 */
-        if (is_dummy_id(id)) { g_uagg_skipped++; continue; }
+        /* 配置闸：原始 ID 精确匹配；Spawned 基础过滤不受 normal 覆盖。 */
+        if (unit_count_excluded(id, limbo, carrier)) { g_uagg_skipped++; continue; }
         morph_normalize(id, sizeof(id));        /* v6/D5：DEVOD -> DEVO 等形态归一 */
         /* v6.5：先读 hp / 老兵度，再做聚合。原先这两行在读之前就 merged/continue，
            导致第二个及以后的同型单位只加了 count，hp 与 vet 恒为 0——
@@ -2328,6 +2315,13 @@ int main(int argc, char **argv)
     int dump_screen = 0;
     int out_given = 0;
     int diag_queues_sec = 0;
+    int check_unit_rules = 0;
+
+    if (!unit_count_path(&check_unit_rules)) {
+        fprintf(stderr, "unit-count: invalid configuration path\n");
+        return 2;
+    }
+    if (check_unit_rules) return unit_count_check();
 
     for (i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--pid") && i + 1 < argc) pid = (DWORD)strtoul(argv[++i], NULL, 0);
@@ -2344,16 +2338,19 @@ int main(int argc, char **argv)
             if (diag_queues_sec <= 0) diag_queues_sec = 1;
         }
         else if (!strcmp(argv[i], "--record") && i + 1 < argc) strncpy(record, argv[++i], MAX_PATH - 1);
+        else if (!strcmp(argv[i], "--unit-count-rules") && i + 1 < argc) ++i;
         else if (!strcmp(argv[i], "--help")) {
             printf("hud_bridge.exe [--pid N] [--interval MS] [--out FILE] [--text FILE] "
                    "[--no-text] [--supers N] [--record FILE.jsonl] [--dry-run] [--dump-screen] "
-                   "[--diag-queues [SEC]]\n");
+                   "[--diag-queues [SEC]] [--unit-count-rules FILE] "
+                   "[--check-unit-count-rules FILE]\n");
             return 0;
         }
     }
     if (interval < 100) interval = 100;
     if (max_supers < 0) max_supers = 0;
     if (max_supers > MAX_SUPERS) max_supers = MAX_SUPERS;
+    unit_count_start();   /* dump-screen / dry-run / 守护模式统一使用同一份规则 */
     if (is_dry) {
         /* 没显式给 --out 时不要写真实的 out/hud_state.json：
            直接跑一次 --dry-run 就把直播数据替换成示例，很容易踩。 */
@@ -2528,6 +2525,7 @@ int main(int argc, char **argv)
             SB jb, tb;
             int have_game = 0;
 
+            unit_count_poll();   /* 一帧内保持同一份规则，不在扫描单位时读配置。 */
             if (!g_proc) {
                 DWORD found = game_pid ? game_pid : find_gamemd();
                 if (found) {

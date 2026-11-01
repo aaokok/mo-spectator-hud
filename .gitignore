@@ -5,6 +5,7 @@ Cargo.lock
 
 # Compiled binaries
 *.exe
+*.zip
 
 # Release runtime directory (assembled dynamically; only track README.md and .gitkeep)
 /release/*

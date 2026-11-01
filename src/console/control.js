@@ -192,6 +192,11 @@ async function refreshStatus() {
     App.status = st;
     App.port = st.port;
     App.online = true;
+    if (st.version) {
+      App.version = st.version;
+      const ver = $('appVer');
+      if (ver) ver.textContent = 'v' + st.version;
+    }
     $('railPort').textContent = String(st.port);
     $('railDot').style.background = 'var(--ok)';
     renderStatusPills(st);
@@ -364,6 +369,79 @@ App.copyText = copyText;
 $('btnCopy').onclick = () => {
   copyText(`http://127.0.0.1:${App.port}/overlay`, '已复制 OBS 浏览器源地址');
 };
+
+/* ======================= 检查更新 ======================= */
+
+/* 只查询 GitHub Release 并提示，不下载不安装。
+   按钮 10 秒内禁用，后端另有 30 秒缓存，避免连点打满未认证限流。 */
+let updateBusy = false;
+let updateLockedUntil = 0;
+
+function setUpdateButton(text, disabled) {
+  const btn = $('btnUpdate');
+  const txt = $('btnUpdateTxt');
+  if (txt) txt.textContent = text;
+  if (btn) btn.disabled = !!disabled;
+}
+
+async function checkUpdate() {
+  const now = Date.now();
+  if (updateBusy || now < updateLockedUntil) return;
+  updateBusy = true;
+  updateLockedUntil = now + 10000;
+  setUpdateButton('检查中…', true);
+  try {
+    const r = await api('/app/update/check', { method: 'POST' });
+    if (!r.ok) {
+      toast('检查更新失败：' + (r.error || '未知错误'), 'warn');
+      setUpdateButton('检查更新', false);
+      return;
+    }
+    if (r.has_update) {
+      toast(`发现新版本 ${r.tag}（当前 v${r.local}）`, 'ok');
+      openRelease(r);
+    } else if (r.comparable === false) {
+      toast(`已连接到 GitHub，但版本号无法比较：${r.tag}`, 'warn');
+    } else {
+      toast(`已是最新版本 v${r.local}`, 'ok');
+    }
+  } catch (e) {
+    toast('检查更新失败：' + e.message, 'bad');
+  } finally {
+    updateBusy = false;
+    setUpdateButton('检查更新', true);
+    // 10 秒后自动解锁；期间保留禁用态，给出明确的下次可点时间点。
+    setTimeout(() => {
+      updateLockedUntil = 0;
+      setUpdateButton('检查更新', false);
+    }, 10000);
+  }
+}
+
+/* Release 页用系统浏览器打开，不在 WebView 内跳转。 */
+function openRelease(r) {
+  if (!r.url) return;
+  const box = $('toasts');
+  if (!box) return;
+  const el = document.createElement('div');
+  el.className = 'toast';
+  const d = document.createElement('span');
+  d.className = 'd';
+  const txt = document.createElement('span');
+  txt.textContent = `新版本 ${r.tag} 已发布`;
+  const go = document.createElement('button');
+  go.className = 'undo';
+  go.textContent = '查看更新';
+  go.onclick = () => {
+    window.open(r.url, '_blank', 'noopener');
+    el.remove();
+  };
+  el.append(d, txt, go);
+  box.appendChild(el);
+  setTimeout(() => el.remove(), 12000);
+}
+
+$('btnUpdate').onclick = () => checkUpdate().catch(e => toast('检查更新失败：' + e.message, 'bad'));
 
 /* ======================= 配色 ======================= */
 

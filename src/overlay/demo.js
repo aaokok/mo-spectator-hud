@@ -562,12 +562,14 @@
   }
 
   function updatePlayerChip(el, p) {
+    var flag = el.querySelector('.flag');
+    if ((flag ? flag.getAttribute('src') : '') !== flagOf(p)) return false;
     var title = p.factionCN || p.faction || '';
     if (p.human === false) title += ' · AI' + (p.aiDiff ? ' ' + p.aiDiff : '');
     el.className = 'pchip' + (p.human === false ? ' ai' : '');
     el.style.setProperty('--c', p.color);
     el.title = p.name + (title ? ' · ' + title : '');
-    /* 旗帜是 <img>，不重建；只有电力/资金这两个纯文本片段需要刷新 */
+    /* 国家未变时复用旗帜，只刷新电力/资金；国家变化交给 patchChildren 重建。 */
     var stats = el.querySelector('.pstats');
     if (stats) stats.innerHTML = powerBox(p) + cashBox(p);
   }
@@ -993,6 +995,8 @@
   }
 
   function updateRailCard(card, p, cols, max) {
+    var flag = card.querySelector('.rp-head .flag');
+    if ((flag ? flag.getAttribute('src') : '') !== flagOf(p)) return false;
     card.style.setProperty('--c', p.color);
     var rn = card.querySelector('.rn');
     if (rn) rn.textContent = p.name;
@@ -1131,7 +1135,7 @@
           updateRailCard(card, p, cols, max);
           return card;
         },
-        function (card, p) { updateRailCard(card, p, cols, max); });
+        function (card, p) { return updateRailCard(card, p, cols, max); });
     });
   }
 
@@ -1981,6 +1985,7 @@
         } else {
           renderHeader();
           renderTopBar();
+          renderRails();
           renderQueues();
         }
         return true;

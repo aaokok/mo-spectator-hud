@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+﻿use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -100,6 +100,9 @@ impl Paths {
     }
     pub fn bridge_exe(&self) -> PathBuf {
         self.toolkit_dir.join("hud_bridge.exe")
+    }
+    pub fn unit_count_rules(&self) -> PathBuf {
+        self.toolkit_dir.join("unit_count_rules.ini")
     }
     pub fn state_json(&self) -> PathBuf {
         self.out_dir().join("hud_state.json")
