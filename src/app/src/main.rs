@@ -5,6 +5,7 @@ mod cursor;
 mod config;
 mod envcheck;
 mod follow;
+mod live;
 mod server;
 mod shell;
 mod update;

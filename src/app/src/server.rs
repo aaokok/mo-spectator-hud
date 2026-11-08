@@ -38,6 +38,9 @@ fn try_bind(port: u16, state: Arc<AppState>) -> Result<(), String> {
         tokio::net::TcpListener::bind(("127.0.0.1", port)).await
     })
     .map_err(|e| e.to_string())?;
+    if let Some(watcher) = state.live.watcher(state.paths.state_json()) {
+        tauri::async_runtime::spawn(watcher);
+    }
 
     let router = Router::new()
         .route("/", get(index))
@@ -51,6 +54,7 @@ fn try_bind(port: u16, state: Arc<AppState>) -> Result<(), String> {
         .route("/state/{*path}", get(state_file))
         .route("/icons/{*path}", get(icon_file))
         .route("/cursor/sse", get(cursor_sse))
+        .route("/live/state/sse", get(live_state_sse))
         .route("/cursor/regions", post(cursor_regions))
         .route("/probe", post(probe_ok))
         .route("/probe-error", post(probe_err))
@@ -112,7 +116,14 @@ async fn state_file(
     State(st): State<Arc<AppState>>,
     AxumPath(path): AxumPath<String>,
 ) -> Response {
-    serve_file(&st.paths.toolkit_dir, &path, "no-store", &["json", "txt"]).await
+    serve_file_inner(
+        &st.paths.toolkit_dir,
+        &path,
+        "no-store",
+        &["json", "txt"],
+        Some(&st.live),
+    )
+    .await
 }
 
 /// /icons/<rel>：工具包 icons/，immutable（R7.13 缓存分级）
@@ -136,6 +147,19 @@ async fn cursor_sse(State(st): State<Arc<AppState>>) -> Response {
                 .interval(Duration::from_secs(5))
                 .text("keep-alive"),
         )
+        .into_response()
+}
+
+/// /live/state/sse：独立业务事件流，不复用光标的 broadcast FIFO。
+async fn live_state_sse(State(st): State<Arc<AppState>>) -> Response {
+    (
+        no_store(),
+        Sse::new(st.live.stream()).keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(5))
+                .text("keep-alive"),
+        ),
+    )
         .into_response()
 }
 
@@ -180,6 +204,16 @@ async fn cursor_regions(
 }
 
 async fn serve_file(root: &Path, rel: &str, cache: &'static str, allow: &[&str]) -> Response {
+    serve_file_inner(root, rel, cache, allow, None).await
+}
+
+async fn serve_file_inner(
+    root: &Path,
+    rel: &str,
+    cache: &'static str,
+    allow: &[&str],
+    live: Option<&crate::live::LiveCache>,
+) -> Response {
     let Some(p) = safe_join(root, rel) else {
         return text_resp(StatusCode::FORBIDDEN, "403 forbidden");
     };
@@ -196,12 +230,26 @@ async fn serve_file(root: &Path, rel: &str, cache: &'static str, allow: &[&str])
     }
     let mime = mime_of(&ext);
     match tokio::fs::read(&p).await {
-        Ok(body) => (
-            StatusCode::OK,
-            [(CONTENT_TYPE, mime), (CACHE_CONTROL, cache)],
-            body,
-        )
-            .into_response(),
+        Ok(body) => {
+            let age = live
+                .filter(|_| p == root.join("out/hud_state.json"))
+                .and_then(|cache| cache.source_age_ms_for_bytes(&body));
+            let mut response = (
+                StatusCode::OK,
+                [(CONTENT_TYPE, mime), (CACHE_CONTROL, cache)],
+                body,
+            )
+                .into_response();
+            if let Some(age) = age {
+                if let Ok(value) = age.to_string().parse() {
+                    response.headers_mut().insert(
+                        HeaderName::from_static("x-hud-source-age-ms"),
+                        value,
+                    );
+                }
+            }
+            response
+        }
         Err(_) => text_resp(StatusCode::INTERNAL_SERVER_ERROR, "500 read error"),
     }
 }

@@ -400,6 +400,8 @@ pub struct AppState {
     pub game_hwnd: Mutex<isize>,
     /// R13 光标指示器：采样线程 → /cursor/sse（broadcast，无订阅者时零流量）
     pub cursor_tx: tokio::sync::broadcast::Sender<String>,
+    /// 桥状态共享缓存及唯一文件观察者，独立于光标采样通道。
+    pub live: crate::live::LiveCache,
     /// R23 光标指示器：覆盖层上报的遮盖面板矩形（CSS px，相对覆盖层客户区）。
     /// None = 还没收到上报（或已过期）→ 采样线程退回"常亮"的老行为。
     /// Some(空表) = 当前没有任何面板遮挡 → 指示器完全不出。
@@ -470,6 +472,7 @@ impl AppState {
             overlay_hwnd: Mutex::new(0),
             game_hwnd: Mutex::new(0),
             cursor_tx: cursor_tx.clone(),
+            live: crate::live::LiveCache::new(),
             cursor_regions: Mutex::new(None),
             hotkey_status: Mutex::new(HotkeyStatus {
                 enabled: hotkey_enabled,

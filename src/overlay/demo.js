@@ -66,6 +66,7 @@
        记下最近一次"内容真的变了"的时刻，超过阈值就判定数据是旧的。 */
     liveDataAt: 0,
     liveLastSig: '',
+    liveHealth: null,
     /* live + screen.valid：真实像素几何（游戏坐标系） */
     liveGeom: null,
     /* OBS 覆盖层：背景透明、无游戏画面、画布跟随窗口 */
@@ -1877,17 +1878,13 @@
   /* ------------------------------------------------------------ live source */
 
   function applyLiveModel(d) {
-    if (!window.LIVE_DATA) {
-      state.liveError = 'live-data.js 未加载';
-      return false;
-    }
+    if (!window.LIVE_DATA) throw new Error('live-data.js 未加载');
 
     var model;
     try {
       model = window.LIVE_DATA.toModel(d);
     } catch (err) {
-      state.liveError = '映射失败：' + (err && err.message ? err.message : err);
-      return false;
+      throw new Error('映射失败：' + (err && err.message ? err.message : err));
     }
 
     var prev = state.liveModel;
@@ -1929,7 +1926,7 @@
 
     /* 桥停摆时文件不变，fetch 仍成功。用 ts+frame 做签名判断内容是否真的在推进；
        内容变了才刷新 liveDataAt，供停滞判定用。 */
-    var sig = (d.ts || 0) + ':' + (model.meta.frame || 0) + ':' + (d.pid || 0);
+    var sig = [d.ts || 0, model.meta.frame || 0, d.pid || 0, d.phase || ''].join(':');
     if (sig !== state.liveLastSig) {
       state.liveLastSig = sig;
       state.liveDataAt = state.liveFetchedAt;
@@ -1966,18 +1963,16 @@
     stage.classList.toggle('live-offline', live && !liveOk);
   }
 
-  function fetchLive() {
-    var url = state.liveUrl;
-    if (!url) return Promise.resolve(false);
+  var liveTransport = null, liveTransportUrl = '';
 
-    /* 加时间戳跳过缓存；桥是原子替换，不会读到半截文件 */
-    var sep = url.indexOf('?') >= 0 ? '&' : '?';
-    return fetch(url + sep + '_t=' + Date.now(), { cache: 'no-store' })
-      .then(function (r) {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.json();
-      })
-      .then(function (d) {
+  function ensureLiveTransport() {
+    if (liveTransport) return liveTransport;
+    if (!window.HUD_LIVE_TRANSPORT) throw new Error('live-transport.js 未加载');
+    liveTransport = window.HUD_LIVE_TRANSPORT.create({
+      pollMs: state.livePollMs,
+      staleMs: STALE_SEC * 1000,
+      sse: !/[?&]sse=0(?:&|$)/.test(location.search),
+      onSnapshot: function (d) {
         var changed = applyLiveModel(d);
         if (changed) {
           renderFauxMap();
@@ -1988,13 +1983,35 @@
           renderRails();
           renderQueues();
         }
-        return true;
-      })
-      .catch(function (err) {
-        state.liveError = String(err && err.message ? err.message : err);
+      },
+      onHealth: function (health) {
+        state.liveHealth = health;
+        state.liveError = health.error || '';
+        if (health.ageMs !== null) state.liveDataAt = Date.now() - health.ageMs;
         renderLiveStatus();
-        return false;
-      });
+      }
+    });
+    return liveTransport;
+  }
+
+  function fetchLive() {
+    if (state.source !== 'live' || !state.liveUrl) return Promise.resolve(false);
+    return ensureLiveTransport().refresh();
+  }
+
+  function restartLive() {
+    if (state.source !== 'live') return;
+    if (liveTransportUrl && liveTransportUrl !== state.liveUrl) {
+      state.liveModel = null;
+      state.liveLastSig = '';
+      state.liveDataAt = state.liveFetchedAt = 0;
+      syncToolbarState();
+    }
+    liveTransportUrl = state.liveUrl;
+    state.liveHealth = null;
+    state.liveError = '';
+    ensureLiveTransport().start(state.liveUrl);
+    renderLiveStatus();
   }
 
   function guessLiveUrl() {
@@ -2025,8 +2042,10 @@
       state.liveFetchedAt = 0;
       stage.classList.remove('live-stale');
       syncToolbarState();
-      fetchLive().then(function () { relayoutAndRender(); });
+      restartLive();
     } else {
+      if (liveTransport) liveTransport.stop();
+      state.liveHealth = null;
       state.liveModel = null;
       state.liveError = '';
       state.liveLastSig = '';
@@ -2043,42 +2062,33 @@
 
   function renderLiveStatus() {
     var el = $('#liveStatus');
+    var live = state.source === 'live';
+    var m = state.liveModel;
+    var health = state.liveHealth;
+    var ageMs = health ? health.ageMs :
+      (state.liveDataAt ? Math.max(0, Date.now() - state.liveDataAt) : null);
+    var ph = m && m.meta && m.meta.phase;
+    var matchLike = !ph || ph === 'match';
+    var stale = live && matchLike && ageMs !== null && ageMs >= STALE_SEC * 1000;
+    /* watchdog 独立于请求；连接错误不能跳过覆盖层的陈旧提示。 */
+    stage.classList.toggle('live-stale', stale);
+    stage.classList.toggle('live-error', live && !!state.liveError);
     if (!el) return;
 
-    if (state.source !== 'live') {
+    if (!live) {
       el.textContent = '';
       el.className = 'live-status';
       return;
     }
-    if (state.liveError) {
-      el.textContent = '连接失败：' + state.liveError;
-      el.className = 'live-status bad';
-      return;
-    }
-
-    var m = state.liveModel;
     if (!m) {
-      el.textContent = '等待数据…';
-      el.className = 'live-status';
+      el.textContent = state.liveError ? '连接失败：' + state.liveError : '等待数据…';
+      el.className = 'live-status' + (state.liveError ? ' bad' : '');
       return;
     }
-
-    /* 两个时间要分开看：
-       fetchAge  = 上次成功读文件距今（服务/网络层面）
-       dataAge   = 文件内容上次变化距今（桥是否还在推进） */
-    var now = Date.now();
-    var fetchAge = state.liveFetchedAt ? Math.round((now - state.liveFetchedAt) / 1000) : 0;
-    var dataAge = state.liveDataAt ? Math.round((now - state.liveDataAt) / 1000) : fetchAge;
-    /* post_match 期间桥不再采帧（frame 恒 0），ts 仍在推进；
-       这时按 frame 判停摆会误报，所以只在 match 态判 stale。 */
-    var ph0 = m.meta && m.meta.phase;
-    var matchLike = !ph0 || ph0 === 'match';
-    var stale = matchLike && dataAge > STALE_SEC;
 
     var bits = [];
-    /* phase 来自桥的守护状态机：区分"桥停了"与"客户端/对局还没起"。
-       老桥没有 phase 字段（m.meta.phase 为空），退回只看 ok。 */
-    var ph = m.meta && m.meta.phase;
+    if (state.liveError) bits.push('连接失败：' + state.liveError);
+    /* 对局外保留上一局名单，但 phase 仍以当前桥输出决定显隐。 */
     if (ph === 'no_client') bits.push('客户端未启动');
     else if (ph === 'lobby') bits.push('已进大厅，等待开局');
     else if (ph === 'loading') bits.push('对局加载中');
@@ -2086,8 +2096,7 @@
     else if (!m.ok) bits.push('未进入对局');
     else bits.push('pid ' + m.meta.pid, 'frame ' + m.meta.frame);
     bits.push('schema ' + m.meta.schema);
-    if (stale) bits.push(dataAge + 's 未更新');
-    /* 对局外的 phase 用的是"保留的上一局模型"，这些细节已经过时，别显示 */
+    if (stale) bits.push(Math.floor(ageMs / 1000) + 's 未更新');
     if (matchLike) {
       if (m.meta.out_of_sync) bits.push('不同步');
       if (m.ffa) bits.push('多阵营已并入两列');
@@ -2096,11 +2105,9 @@
 
     el.textContent = bits.join(' · ');
     el.className = 'live-status' +
+      (state.liveError ? ' bad' : '') +
       (stale ? ' stale' : '') +
       (!m.ok ? ' wait' : '');
-
-    /* 覆盖层模式下数据停了要让画面自己说明，而不是把旧人头留在直播间 */
-    stage.classList.toggle('live-stale', state.source === 'live' && stale);
   }
 
   /* ---------------------------------------------------------------- events */
@@ -2292,13 +2299,13 @@
   liveUrl.addEventListener('change', function () {
     var v = liveUrl.value.trim();
     state.liveUrl = v;
-    if (state.source === 'live') fetchLive();
+    if (state.source === 'live') restartLive();
   });
 
   liveUrl.addEventListener('keydown', function (e) {
     if (e.key === 'Enter') {
       state.liveUrl = liveUrl.value.trim();
-      if (state.source === 'live') fetchLive();
+      if (state.source === 'live') restartLive();
     }
   });
 
@@ -2432,6 +2439,8 @@
       queueBusyCells: $$('.qitem:not(.idle)').length,
       livePhase: state.liveModel && state.liveModel.meta ? (state.liveModel.meta.phase || null) : null,
       liveError: state.liveError || null,
+      liveTransport: state.liveHealth ? state.liveHealth.transport : null,
+      liveSourceAgeKnown: state.liveHealth ? state.liveHealth.sourceAgeKnown : false,
       liveAgeSec: state.liveFetchedAt ? Math.round((Date.now() - state.liveFetchedAt) / 1000) : null,
       liveDataAgeSec: state.liveDataAt ? Math.round((Date.now() - state.liveDataAt) / 1000) : null,
       liveStale: stage.classList.contains('live-stale'),
@@ -2552,16 +2561,16 @@
     relayoutAndRender();
   }
 
-  /* live 轮询：链式 setTimeout，避免请求叠加；间隔跟桥的 500 ms 对齐 */
-  function liveLoop() {    if (state.source === 'live') {
-      fetchLive().then(function () {
-        renderLiveStatus();
-        setTimeout(liveLoop, state.livePollMs);
-      });
-    } else {
-      setTimeout(liveLoop, 500);
-    }
-  }
+  /* 从后台恢复时立即补取；停滞时钟由传输层保留，不重新获得宽限。 */
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && state.source === 'live') fetchLive();
+  });
+  window.addEventListener('pagehide', function () {
+    if (liveTransport) liveTransport.stop();
+  });
+  window.addEventListener('pageshow', function (event) {
+    if (event.persisted && state.source === 'live') restartLive();
+  });
 
   /* 闪烁回归指标：live 500 ms 轮询不应销毁任何 <img>；
      若回归到 innerHTML 全量重建，这里会每帧上涨（写进 probe 的 imgRecycled）。 */
@@ -2634,7 +2643,6 @@
   }
 
   setInterval(tick, 1000);
-  liveLoop();
 
   /* probe 需要等 live 首次拉取和布局稳定 */
   setTimeout(writeProbe, 1600);
