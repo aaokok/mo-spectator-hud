@@ -55,6 +55,9 @@
     try { window.dispatchEvent(new CustomEvent('ctrl-supers')); } catch (e) {}
   }
 
+  var lastLayoutSig = null;
+  var lastTextSig = null;
+
   function apply() {
     if (!CTRL) return;
     var railChk = document.getElementById('railChk');
@@ -63,15 +66,30 @@
     var queueColumn = document.getElementById('queueColumn');
     var hud = document.getElementById('hud');
 
-    if (railChk && railChk.checked !== CTRL.show_units) railChk.checked = CTRL.show_units;
-    if (gateChk && gateChk.checked !== CTRL.observer_gate) gateChk.checked = CTRL.observer_gate;
-    if (queueChk && queueChk.checked !== CTRL.show_queues) {
-      queueChk.checked = CTRL.show_queues;
-      /* 与 demo.js 工具栏 queueChk 的 change 处理保持同一行为 */
+    var layoutChanged = false;
+    if (railChk && railChk.checked !== !!CTRL.show_units) {
+      railChk.checked = !!CTRL.show_units;
+      layoutChanged = true;
+    }
+    if (gateChk && gateChk.checked !== !!CTRL.observer_gate) {
+      gateChk.checked = !!CTRL.observer_gate;
+      layoutChanged = true;
+    }
+    if (queueChk && queueChk.checked !== !!CTRL.show_queues) {
+      queueChk.checked = !!CTRL.show_queues;
       if (queueColumn) queueColumn.classList.toggle('hidden', !CTRL.show_queues);
+      layoutChanged = true;
     }
     /* 比分块:保占位隐藏,顶栏左右分队布局不跳动 */
     if (hud) hud.classList.toggle('no-score', !CTRL.show_score);
+    var layoutSig = JSON.stringify([!!CTRL.show_units, !!CTRL.show_queues, !!CTRL.observer_gate, !!CTRL.show_score]);
+    if (lastLayoutSig !== null && layoutSig !== lastLayoutSig) layoutChanged = true;
+    lastLayoutSig = layoutSig;
+
+    var textSig = JSON.stringify([CTRL.match_name || '', Number(CTRL.score_l) || 0, Number(CTRL.score_r) || 0, CTRL.mode_label || '']);
+    var textChanged = (lastTextSig !== null && textSig !== lastTextSig);
+    lastTextSig = textSig;
+
     /* R22：未进入对局时在本地窗口/预览里显示「等待进入对局…」提示。
        键缺省视为开（老控制台不传该键时保持原有观感）。
        覆盖层的透明压制另由 overlay-mode 规则处理，与这个开关无关。 */
@@ -90,27 +108,44 @@
       try { window.dispatchEvent(new CustomEvent('ctrl-queue-hide')); } catch (e) {}
     }
     /* R10 顶栏左上让位:游戏自己的事件/超武文字从让出的竖条透出
-       (demo.js 按 body.yield-tl 让位;键缺省视为开,与控制台默认一致)。
+       (demo.js 按 body.yield-tl 让位;键缺省视为关,与控制台默认一致)。
        状态翻转时派发事件让 demo.js 立即重排顶栏。 */
-    var yOn = CTRL.yield_top_left !== false;
+    var yOn = !!CTRL.yield_top_left;
     var had = document.body.classList.contains('yield-tl');
     document.body.classList.toggle('yield-tl', yOn);
     if (yOn !== had) {
       try { window.dispatchEvent(new CustomEvent('ctrl-yield')); } catch (e) {}
     }
+    if (layoutChanged) {
+      try { window.dispatchEvent(new CustomEvent('ctrl-layout')); } catch (e) {}
+    }
+    if (textChanged) {
+      try { window.dispatchEvent(new CustomEvent('ctrl-text')); } catch (e) {}
+    }
     applyUnitCustom();
     applySuperCustom();
   }
 
+  /* 不可变浅拷贝覆盖：绝不原地污染 state.liveModel，清空赛事名/模式名立刻恢复桥原值。
+     决策 B1：局分独立于赛事名生效（任一侧 > 0 或赛事名非空即覆盖 series）。 */
   window.__ctrlPatch = function (m) {
     if (!CTRL || !m) return m;
+    var patch = null;
     if (CTRL.match_name) {
-      m.map = CTRL.match_name;
-      m.series = { A: CTRL.score_l, B: CTRL.score_r };
+      patch = Object.assign({}, m, { map: CTRL.match_name });
+    }
+    var scoreL = Number(CTRL.score_l) || 0;
+    var scoreR = Number(CTRL.score_r) || 0;
+    if (CTRL.match_name || scoreL > 0 || scoreR > 0) {
+      patch = patch || Object.assign({}, m);
+      patch.series = { A: scoreL, B: scoreR };
     }
     /* R11：模式标签覆盖（LAN/遭遇战/自定义文案）；空 = 用桥数据原值 */
-    if (CTRL.mode_label) m.modeLabel = CTRL.mode_label;
-    return m;
+    if (CTRL.mode_label) {
+      patch = patch || Object.assign({}, m);
+      patch.modeLabel = CTRL.mode_label;
+    }
+    return patch || m;
   };
 
   function poll() {
@@ -121,5 +156,8 @@
   }
 
   poll();
-  setInterval(poll, 1500);
+  var pollTimer = setInterval(poll, 1500);
+  window.addEventListener('pagehide', function () {
+    clearInterval(pollTimer);
+  });
 })();

@@ -43,13 +43,26 @@ async function api(path, opts) {
 }
 App.api = api;
 
-/** /control/set 走表单编码（与 v1 契约一致） */
+/** /control/set 走表单编码（与 v1 契约一致），成功后广播同步跨页控件与视图 */
 App.postControl = async function (patch) {
   const body = new URLSearchParams(patch);
   const snap = await api('/control/set', { method: 'POST', body });
   App.ctrl = snap;
+  syncCtrlConsumers(snap);
   return snap;
 };
+
+function syncCtrlConsumers(c) {
+  if (!c) return;
+  $$('.trow').forEach(r => { if (r._refresh) r._refresh(); });
+  for (const name of Object.keys(App.pages)) {
+    const p = App.pages[name];
+    if (p && p.onCtrl) {
+      try { p.onCtrl(c); } catch (e) { console.error('onCtrl failed: ' + name, e); }
+    }
+  }
+  renderTextEcho();
+}
 
 /* ======================= 格式化 ======================= */
 
@@ -159,6 +172,13 @@ const ROUTE_KEY = 'mo_hud_route';
 
 function goto(name) {
   if (!TITLES[name]) name = 'overview';
+  const prev = App.route;
+  if (prev && prev !== name) {
+    const prevPage = App.pages[prev];
+    if (prevPage && prevPage.onHide) {
+      try { prevPage.onHide(); } catch (e) { console.error('onHide failed: ' + prev, e); }
+    }
+  }
   App.route = name;
   $$('#nav button').forEach(b => {
     const on = b.dataset.page === name;
@@ -302,7 +322,7 @@ function renderOverlayPills(st) {
   setP('ovPillFollow', o.game_found ? 'ok' : '', o.game_found ? '跟随中' : '未找到游戏');
 
   const vb = $('btnOvVisible');
-  if (vb) vb.textContent = hs === 'hidden' ? '显示 HUD' : '隐藏 HUD';
+  if (vb) vb.textContent = hs === 'hidden' ? '显示 HUD' : hs === 'paused' ? '固定显示' : '隐藏 HUD';
   const tb = $('btnOvTopmost');
   if (tb) tb.textContent = o.topmost ? '取消置顶' : '设为置顶';
 }
@@ -319,17 +339,23 @@ async function setOverlay(patch) {
   App.status = st;
   renderStatusPills(st);
   renderOverlayPills(st);
+  $$('.trow').forEach(r => { if (r._refresh) r._refresh(); });
+  const page = App.pages[App.route];
+  if (page && page.onStatus) page.onStatus(st);
   return st;
 }
 App.setOverlay = setOverlay;
 
-/** 点主按钮：隐藏在 ⇄ 显示（显示时带 pin，压过失焦暂停） */
+/** 点主按钮：隐藏/失焦暂停 ⇄ 显示（显示时带 pin，压过失焦暂停） */
 App.toggleHud = async function (silent) {
   const st = App.status || await refreshStatus();
   const hs = hudState(st);
-  if (hs === 'hidden') {
+  if (hs === 'hidden' || hs === 'paused') {
     await setOverlay({ visible: true, pin: true });
-    if (!silent) toast('HUD 已显示（回到游戏后恢复自动）', 'ok', () => setOverlay({ visible: false, pin: false }));
+    const undo = hs === 'hidden'
+      ? () => setOverlay({ visible: false, pin: false })
+      : () => setOverlay({ visible: true, pin: false });
+    if (!silent) toast('HUD 已固定显示（回到游戏后恢复自动）', 'ok', undo);
   } else {
     await setOverlay({ visible: false, pin: false });
     if (!silent) toast('HUD 已隐藏', 'ok', () => setOverlay({ visible: true, pin: false }));
@@ -567,16 +593,27 @@ initRefZoom();
 /* ======================= 热键 ======================= */
 
 const HOTKEY_DEFAULT = { enabled: false, visible: 'ctrl+alt+h', topmost: 'ctrl+alt+t' };
+let hotkeyDirty = false;
+let hotkeyInitialized = false;
 
-function renderHotkeyStatus(h) {
+for (const id of ['hotkey_visible', 'hotkey_topmost']) {
+  const inp = $(id);
+  if (inp) inp.addEventListener('input', () => { hotkeyDirty = true; });
+}
+
+function renderHotkeyStatus(h, forceFill) {
   if (!h) return;
-  // 回填输入框：否则点了「应用」会把没动过的那个键位当空串提交，把热键清掉
+  // 仅初次加载、点击应用后，或用户未编辑/未录制且不在焦点时回填，防止 1.5s 轮询冲掉刚录好的键位
   for (const [id, val] of [['hotkey_visible', h.visible], ['hotkey_topmost', h.topmost]]) {
     const inp = $(id);
     const ae = document.activeElement;
     const editing = ae && (ae.id === id || ae.id === 'btnHotkeyCapture' || ae.id === 'btnHotkeyCapture2');
-    if (inp && !editing) inp.value = val || '';
+    if (inp && (forceFill || !hotkeyInitialized || (!hotkeyDirty && !editing))) {
+      inp.value = val || '';
+    }
   }
+  hotkeyInitialized = true;
+  if (forceFill) hotkeyDirty = false;
   const el = $('hotkeyStatusTxt');
   if (!h.enabled) {
     el.textContent = '已关闭';
@@ -658,6 +695,7 @@ function bindCapture(btn) {
         return;
       }
       input.value = accel;
+      hotkeyDirty = true;
       done = true;
       cleanup();
       toast(`已录制 ${accel}，点「应用热键」生效`);
@@ -686,10 +724,16 @@ $('btnHotkeyApply').onclick = async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    renderHotkeyStatus(r);
+    renderHotkeyStatus(r, true);
     App.refreshStatus().catch(() => {});
-    if (r.ok) toast('热键已更新：' + [r.visible && `显隐 ${r.visible}`, r.topmost && `置顶 ${r.topmost}`].filter(Boolean).join(' · '));
-    else toast('热键注册失败：' + (r.error || '未知原因'), 'bad');
+    if (!r.enabled) {
+      toast('已保存键位（热键总开关关闭，开启后生效）', 'ok');
+    } else if (r.ok) {
+      const desc = [r.visible && `显隐 ${r.visible}`, r.topmost && `置顶 ${r.topmost}`].filter(Boolean).join(' · ');
+      toast(desc ? '热键已更新：' + desc : '热键已清空');
+    } else {
+      toast('热键注册失败：' + (r.error || '未知原因'), 'bad');
+    }
   } catch (e) {
     toast('保存失败：' + e.message, 'bad');
   }
@@ -698,6 +742,7 @@ $('btnHotkeyApply').onclick = async () => {
 $('btnHotkeyReset').onclick = () => {
   $('hotkey_visible').value = HOTKEY_DEFAULT.visible;
   $('hotkey_topmost').value = HOTKEY_DEFAULT.topmost;
+  hotkeyDirty = true;
   toast('已填入默认键位，点「应用热键」生效');
 };
 
@@ -810,10 +855,8 @@ function ToggleRow(o) {
       toast(`「${o.label}」${current ? '已开启' : '已关闭'}`, 'ok',
         async () => {
           if (o.set) await o.set(prev); else await App.postControl({ [o.key]: prev ? '1' : '0' });
-          paint(read());
-          if (o.onChange) o.onChange(current);
-          el.classList.remove('mod');
-          modded = false;
+          if (el._refresh) el._refresh();
+          if (o.onChange) o.onChange(read());
         });
     } catch (e) {
       el.classList.remove('saving');
@@ -845,11 +888,24 @@ const textInputs = [
 ];
 
 let textTimer = null;
+let pendingTextPatch = Object.create(null);
+
+function flushTextTimers() {
+  clearTimeout(textTimer);
+  textTimer = null;
+  pendingTextPatch = Object.create(null);
+}
+
 function pushText(patch) {
+  Object.assign(pendingTextPatch, patch);
   clearTimeout(textTimer);
   textTimer = setTimeout(() => {
-    App.postControl(patch)
-      .then(() => { renderTextEcho(); refreshCtrl().catch(() => {}); })
+    const batch = pendingTextPatch;
+    pendingTextPatch = Object.create(null);
+    textTimer = null;
+    if (!Object.keys(batch).length) return;
+    App.postControl(batch)
+      .then(() => { renderTextEcho(); })
       .catch(e => toast('文案保存失败：' + e.message, 'bad'));
   }, 400);
 }
@@ -875,9 +931,15 @@ function bindTextInputs() {
     b.onclick = () => {
       const key = b.dataset.clear;
       const patch = {};
-      if (key === 'score') { patch.score_l = '0'; patch.score_r = '0'; }
-      else patch[key] = '';
-      clearTimeout(textTimer);
+      if (key === 'score') {
+        patch.score_l = '0'; patch.score_r = '0';
+        delete pendingTextPatch.score_l;
+        delete pendingTextPatch.score_r;
+      } else {
+        patch[key] = '';
+        delete pendingTextPatch[key];
+      }
+      if (!Object.keys(pendingTextPatch).length) flushTextTimers();
       App.postControl(patch).then(() => {
         refreshCtrl();
         renderTextEcho();
@@ -886,6 +948,7 @@ function bindTextInputs() {
     };
   });
   $('btnResetText').onclick = () => {
+    flushTextTimers();
     const patch = { match_name: '', score_l: '0', score_r: '0', mode_label: '' };
     App.postControl(patch).then(() => {
       refreshCtrl();
@@ -1142,18 +1205,53 @@ $('btnReport').onclick = () => copyText(envReportText(), '环境报告已复制'
 let logPaused = false;
 async function refreshLog() {
   try {
-    const { lines } = await api('/app/log');
-    if (App.pages.logs && App.pages.logs.setLines) App.pages.logs.setLines(lines);
-    return lines;
+    const res = await api('/app/log');
+    if (App.pages.logs && App.pages.logs.setLines) App.pages.logs.setLines(res.lines, res.seq);
+    return res.lines;
   } catch (e) { return null; }
 }
 App.refreshLog = refreshLog;
 App.isLogPaused = () => logPaused;
-App.setLogPaused = v => { logPaused = v; };
+App.setLogPaused = v => { logPaused = !!v; };
 
 /* ======================= 初始化 ======================= */
 
-let statusTimer = null, logTimer = null, summaryTimer = null;
+let statusTimer = null, logTimer = null;
+
+function startTimers() {
+  if (!statusTimer) {
+    statusTimer = setInterval(() => {
+      if (!document.hidden) refreshStatus().catch(() => {});
+    }, 1500);
+  }
+  if (!logTimer) {
+    logTimer = setInterval(() => {
+      if (!document.hidden && App.route === 'logs' && !logPaused) refreshLog();
+    }, 2000);
+  }
+}
+
+function stopTimers() {
+  if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+  if (logTimer) { clearInterval(logTimer); logTimer = null; }
+}
+
+document.addEventListener('visibilitychange', () => {
+  const page = App.pages[App.route];
+  if (document.hidden) {
+    stopTimers();
+    if (page && page.onHide) {
+      try { page.onHide(); } catch (e) { console.error('onHide failed:', e); }
+    }
+  } else {
+    startTimers();
+    refreshStatus().catch(() => {});
+    if (page && page.onShow) {
+      try { page.onShow(); } catch (e) { console.error('onShow failed:', e); }
+    }
+    if (App.route === 'logs' && !logPaused) refreshLog();
+  }
+});
 
 async function boot() {
   bindTextInputs();
@@ -1180,13 +1278,12 @@ async function boot() {
     await refreshStatus();
     await refreshCtrl();
     loadEnv(false).catch(() => {});
-    refreshLog();
+    if (App.route === 'logs') refreshLog();
   } catch (e) {
     toast('无法连接本地服务，请确认 mo_hud.exe 正在运行', 'bad');
   }
 
-  statusTimer = setInterval(() => refreshStatus().catch(() => {}), 1500);
-  logTimer = setInterval(() => { if (!logPaused) refreshLog(); }, 2000);
+  if (!document.hidden) startTimers();
   return;
 }
 

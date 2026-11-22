@@ -109,8 +109,8 @@ function init() {
   wirePreviewToggle();
   wirePreview();
   loadSummary();
-  // 只在总览页可见时轮询，切到别的页就停
-  setInterval(() => { if (App.route === 'overview') loadSummary(); }, 2000);
+  // 只在总览页且窗口可见时轮询，切页或最小化自动停止
+  setInterval(() => { if (App.route === 'overview' && !document.hidden) loadSummary(); }, 2000);
 }
 
 /** 预览：仅在页面可见时加载，避免后台持续解码 */
@@ -124,11 +124,11 @@ function wirePreview(){
 function mountPreview() {
   const frame = $('previewFrame');
   if (frameLoaded) return;
-  if (!previewEnabled()) return;
+  if (!previewEnabled() || App.route !== 'overview' || document.hidden) return;
   frameLoaded = true;
   frame.style.display = '';
-  // 与覆盖窗口同 URL；local=1 让页面走覆盖模式（透明、无工具栏）
-  frame.src = `http://127.0.0.1:${App.port}/?overlay=1&local=1&source=live&url=/state/out/hud_state.json`;
+  // nocursor=1：控制台小预览不连 /cursor/sse，避免击穿 Rust cursor.rs 省电闸门
+  frame.src = `http://127.0.0.1:${App.port}/?overlay=1&local=1&nocursor=1&source=live&url=/state/out/hud_state.json`;
   frame.onload = () => {
     const ph = $('previewPh');
     if (ph) ph.style.display = 'none';
@@ -250,15 +250,17 @@ function syncPreview() {
     $('ovlSub').textContent = '回到游戏窗口即自动恢复（或点「固定显示」）';
   } else if (hs === 'hidden') {
     $('ovlTitle').textContent = 'HUD 已隐藏';
-    $('ovlSub').textContent = '覆盖窗口与 OBS 画面都不会显示';
+    $('ovlSub').textContent = '仅隐藏本地覆盖窗口，不影响 OBS 浏览器源';
   } else {
     $('ovlTitle').textContent = '';
     $('ovlSub').textContent = '';
   }
 
   const g = st.game_state || {};
+  const visible = App.route === 'overview' && !document.hidden;
   const has = !!(g.present && g.mtime_ms && Date.now() - g.mtime_ms <= 8000) && previewEnabled();
-  if (has) mountPreview();
+  if (has && visible) mountPreview();
+  else if (!visible && frameLoaded) teardownPreview();
   const ph = $('previewPh');
   if (ph) {
     if (!previewEnabled()) {
@@ -346,6 +348,9 @@ App.registerPage('overview', {
     applyPreviewState();
     if (App.status) { renderStats(App.status); syncPreview(); }
     loadSummary();
+  },
+  onHide: () => {
+    teardownPreview();
   },
   onCtrl: () => {
     updateQuickCount();

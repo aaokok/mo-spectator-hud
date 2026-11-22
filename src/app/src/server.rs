@@ -150,17 +150,9 @@ async fn cursor_sse(State(st): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-/// /live/state/sse：独立业务事件流，不复用光标的 broadcast FIFO。
+/// /live/state/sse：独立业务事件流（LiveStream 自带 1s health 心跳，无需额外 KeepAlive）。
 async fn live_state_sse(State(st): State<Arc<AppState>>) -> Response {
-    (
-        no_store(),
-        Sse::new(st.live.stream()).keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(5))
-                .text("keep-alive"),
-        ),
-    )
-        .into_response()
+    (no_store(), Sse::new(st.live.stream())).into_response()
 }
 
 /// R23 /cursor/regions：覆盖层上报遮盖面板矩形（CSS px，覆盖层客户区坐标）。
@@ -293,8 +285,9 @@ fn no_store() -> [(HeaderName, &'static str); 1] {
 async fn overlay_redirect(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
+    // 决策 A1：OBS 浏览器源不附带 local=1，未进对局时默认全透明不挡直播间；
+    // 本地覆盖窗口在 shell.rs 中独立带 local=1。
     let defaults = [
-        ("local", "1"),
         ("source", "live"),
         ("url", "/state/out/hud_state.json"),
     ];
@@ -548,7 +541,7 @@ async fn envcheck(State(st): State<Arc<AppState>>, Query(q): Query<HashMap<Strin
 // ---------- /app/* ----------
 
 async fn app_status(State(st): State<Arc<AppState>>) -> Response {
-    let game_state = read_state_meta(&st.paths.state_json());
+    let game_state = read_state_meta(&st.live);
     let ini = st.ini.lock().unwrap().clone();
     let bridge = st.bridge.lock().unwrap();
     let hotkey = st.hotkey_status.lock().unwrap().clone();
@@ -561,7 +554,7 @@ async fn app_status(State(st): State<Arc<AppState>>) -> Response {
             // R16：真实可见 = visible && !auto_hidden；显隐按钮/状态条靠这三项判三态
             "auto_hidden": st.ov_auto_hidden.load(Ordering::Relaxed),
             "pinned": st.ov_user_pin.load(Ordering::Relaxed),
-            "game_found": *st.game_hwnd.lock().unwrap() != 0,
+            "game_found": st.game_hwnd.load(Ordering::Relaxed) != 0,
         },
         "hotkeys": {
             "enabled": hotkey.enabled,
@@ -583,9 +576,13 @@ async fn app_status(State(st): State<Arc<AppState>>) -> Response {
 }
 
 async fn app_log(State(st): State<Arc<AppState>>) -> Response {
-    let q = st.log.lock().unwrap();
-    let tail: Vec<String> = q.iter().rev().take(200).rev().cloned().collect();
-    (StatusCode::OK, no_store(), Json(json!({ "lines": tail }))).into_response()
+    let (tail, seq) = {
+        let q = st.log.lock().unwrap();
+        let tail: Vec<String> = q.iter().rev().take(500).rev().cloned().collect();
+        let seq = st.log_seq.load(Ordering::Relaxed);
+        (tail, seq)
+    };
+    (StatusCode::OK, no_store(), Json(json!({ "lines": tail, "seq": seq }))).into_response()
 }
 
 /// 更新检查：只读 GitHub Release，不下载、不安装。
@@ -646,14 +643,9 @@ async fn app_update_check(State(st): State<Arc<AppState>>) -> Response {
 }
 
 /// R16 `/app/summary`：控制台总览用的轻量对局摘要。
-/// hud_state.json 含全部 unit_types/queues（1 MB+），控制台只用得着地图/进度/四人战绩，
-/// 这里在 Rust 侧裁剪后返回，避免前端每 2 秒拉整份状态。
+/// 直接消费 LiveCache 内存快照，零磁盘读取、零重复 JSON 解析。
 async fn app_summary(State(st): State<Arc<AppState>>) -> Response {
-    let p = st.paths.state_json();
-    let Ok(txt) = tokio::fs::read_to_string(&p).await else {
-        return (StatusCode::OK, no_store(), Json(json!({ "present": false }))).into_response();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+    let Some((v, mtime)) = st.live.latest_snapshot() else {
         return (StatusCode::OK, no_store(), Json(json!({ "present": false }))).into_response();
     };
 
@@ -683,13 +675,6 @@ async fn app_summary(State(st): State<Arc<AppState>>) -> Response {
         })
         .unwrap_or_default();
 
-    let mtime = std::fs::metadata(&p)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
     (StatusCode::OK, no_store(), Json(json!({
         "present": true,
         "mtime_ms": mtime,
@@ -698,6 +683,7 @@ async fn app_summary(State(st): State<Arc<AppState>>) -> Response {
         "out_of_sync": v["out_of_sync"],
         "elapsed_sec": v["elapsed_sec"],
         "map": v["map"],
+        "map_uiname": v["map_uiname"],
         "game_mode": v["game_mode"],
         "players_in_session": v["players_in_session"],
         "observer": v["observer"],
@@ -739,6 +725,9 @@ struct OverlayReq {
 async fn app_overlay(State(st): State<Arc<AppState>>, Json(req): Json<OverlayReq>) -> Response {
     if let Some(v) = req.visible {
         st.ov_visible.store(v, Ordering::Relaxed);
+        if !v {
+            st.ov_user_pin.store(false, Ordering::Relaxed);
+        }
         st.log(format!("覆盖窗口显隐 -> {v}"));
     }
     if let Some(t) = req.topmost {
@@ -750,6 +739,9 @@ async fn app_overlay(State(st): State<Arc<AppState>>, Json(req): Json<OverlayReq
     }
     if let Some(p) = req.pin {
         st.ov_user_pin.store(p, Ordering::Relaxed);
+        if p {
+            st.ov_auto_hidden.store(false, Ordering::Relaxed);
+        }
         st.log(format!("覆盖窗口钉住 -> {p}"));
     }
     crate::shell::apply_overlay_flags(&st);
@@ -810,23 +802,11 @@ async fn app_hotkeys(State(st): State<Arc<AppState>>, Json(req): Json<HotkeyReq>
 
 // ---------- 工具 ----------
 
-/// 读 hud_state.json 的顶层状态（不解析 players，只取桥状态）
-fn read_state_meta(p: &Path) -> serde_json::Value {
-    let Ok(txt) = std::fs::read_to_string(p) else {
+/// 从 LiveCache 内存快照读取顶层状态（零磁盘读取）
+fn read_state_meta(live: &crate::live::LiveCache) -> serde_json::Value {
+    let Some((v, mtime)) = live.latest_snapshot() else {
         return json!({ "present": false });
     };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
-        return json!({ "present": false });
-    };
-    let mtime = std::fs::metadata(p)
-        .and_then(|m| m.modified())
-        .ok()
-        .map(|t| {
-            t.duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
-        })
-        .unwrap_or(0);
     json!({
         "present": true,
         "ok": v["ok"],
@@ -836,4 +816,83 @@ fn read_state_meta(p: &Path) -> serde_json::Value {
         "paused": v["paused"],
         "mtime_ms": mtime,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Paths;
+    use std::time::{Instant, SystemTime};
+
+    fn test_state(tag: &str) -> Arc<AppState> {
+        let dir = std::env::temp_dir().join(format!("mo-srv-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(AppState::new(Paths {
+            exe_dir: dir.clone(),
+            app_root: dir.clone(),
+            demo_root: dir.clone(),
+            toolkit_dir: dir.clone(),
+            ini: dir.join("mo_hud.ini"),
+        }))
+    }
+
+    #[tokio::test]
+    async fn overlay_redirect_omits_local_for_obs_by_default() {
+        let resp = overlay_redirect(Query(HashMap::new())).await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let loc = resp.headers().get(LOCATION).unwrap().to_str().unwrap();
+        assert!(loc.contains("overlay=1"));
+        assert!(loc.contains("source=live"));
+        assert!(!loc.contains("local=1"), "OBS 默认跳转不应带 local=1: {loc}");
+    }
+
+    #[tokio::test]
+    async fn app_summary_and_status_read_from_live_cache_with_map_uiname() {
+        let st = test_state("summary");
+        let raw = serde_json::to_vec(&json!({
+            "schema": 2,
+            "ok": true,
+            "phase": "match",
+            "client_running": true,
+            "frame": 120,
+            "paused": false,
+            "elapsed_sec": 42,
+            "map": "红警测试图",
+            "map_uiname": "中文图名",
+            "game_mode": 3,
+            "players_in_session": 2,
+            "observer": {"is_observer": true},
+            "screen": {"valid": true, "width": 1920, "height": 1080, "sidebar_side": 1},
+            "players": []
+        }))
+        .unwrap();
+        // 磁盘上根本没有 hud_state.json，验证完全走 LiveCache 内存快照
+        st.live.seed_for_test(raw, SystemTime::now(), Instant::now());
+        let resp = app_summary(State(st.clone())).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["present"], true);
+        assert_eq!(body["map"], "红警测试图");
+        assert_eq!(body["map_uiname"], "中文图名");
+
+        let meta = read_state_meta(&st.live);
+        assert_eq!(meta["present"], true);
+        assert_eq!(meta["frame"], 120);
+        let _ = std::fs::remove_dir_all(&st.paths.app_root);
+    }
+
+    #[tokio::test]
+    async fn app_log_returns_up_to_500_lines_and_monotonic_seq() {
+        let st = test_state("log");
+        for i in 0..520 {
+            st.log(format!("line-{i}"));
+        }
+        let resp = app_log(State(st.clone())).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["lines"].as_array().unwrap().len(), 500);
+        assert_eq!(body["seq"].as_u64().unwrap(), 520);
+        let _ = std::fs::remove_dir_all(&st.paths.app_root);
+    }
 }

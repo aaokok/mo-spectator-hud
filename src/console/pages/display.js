@@ -48,7 +48,7 @@ const LAYOUT = [
   {
     key: 'yield_top_left', label: '顶栏左上让位',
     descOn: '左上角留出竖条，游戏超武 / 事件文字可透出',
-    descOff: '关闭后左上角被顶栏盖住，游戏事件文字不可见',
+    descOff: '关闭后左上角被顶栏盖住，游戏事件文字不可见（默认关）',
   },
 ];
 
@@ -105,7 +105,7 @@ function init() {
     const row = App.ToggleRow({
       ...o,
       scope: 'sync',
-      defaultValue: true,
+      defaultValue: false,
       onChange: updateLayoutFlag,
     });
     lHost.appendChild(row);

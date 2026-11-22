@@ -41,11 +41,21 @@ fn main() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 match window.label() {
-                    // 关控制窗口 = 退出整个应用
-                    "control" => window.app_handle().exit(0),
-                    // 关覆盖窗口 = 隐藏（托盘/热键可再开）
+                    // 关控制窗口 = 退出整个应用（先显式回收托管数据桥，避免无 Job 时留孤儿）
+                    "control" => {
+                        if let Some(st) = window.app_handle().try_state::<Arc<config::AppState>>() {
+                            bridge::shutdown(&st);
+                        }
+                        window.app_handle().exit(0);
+                    }
+                    // 关覆盖窗口 = 隐藏（托盘/热键可再开），同步显隐状态避免失焦回归后擅自弹回
                     "overlay" => {
                         api.prevent_close();
+                        if let Some(st) = window.app_handle().try_state::<Arc<config::AppState>>() {
+                            st.ov_visible.store(false, std::sync::atomic::Ordering::Relaxed);
+                            st.ov_user_pin.store(false, std::sync::atomic::Ordering::Relaxed);
+                            st.log("覆盖窗口被关闭 -> 已隐藏");
+                        }
                         let _ = window.hide();
                     }
                     _ => {}

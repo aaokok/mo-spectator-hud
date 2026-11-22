@@ -23,7 +23,7 @@
   <aside class="rail">
     <div class="brand">
       <div class="mark">MO</div>
-      <div class="ver" id="appVer">v0.1.3</div>
+      <div class="ver" id="appVer">v0.1.4</div>
     </div>
     <nav class="nav" id="nav">
       <button data-page="overview" class="on" aria-current="page">
@@ -618,6 +618,7 @@
                   <tr><td>Esc 菜单时隐藏队列</td><td class="on">开</td></tr>
                   <tr><td>等待对局提示</td><td class="on">开</td></tr>
                   <tr><td>观察者门槛</td><td class="off">关</td></tr>
+                  <tr><td>顶栏左上让位</td><td class="off">关</td></tr>
                   <tr><td>游戏失焦时自动隐藏</td><td class="on">开</td></tr>
                   <tr><td>鼠标指针指示器</td><td class="on">开</td></tr>
                   <tr><td>仅在遮挡时显示指针</td><td class="on">开</td></tr>
@@ -684,9 +685,17 @@
 
 <script>
 /* 控制台脚本异常回传（无论是否带 ?probe=1）。
-   控制台是发布物里唯一没有开发者工具入口的页面，静默 JS 错误等于日志盲区。 */
+   控制台是发布物里唯一没有开发者工具入口的页面，静默 JS 错误等于日志盲区。
+   去重 + 上限 20 条 + 可重入保护 + .catch()，避免服务断连触发 unhandledrejection 死循环。 */
 (function () {
+  var seen = Object.create(null), sent = 0, MAX = 20, reporting = false;
   function report(kind, payload) {
+    if (reporting || sent >= MAX) return;
+    var key = kind + '|' + String((payload && payload.msg) || '');
+    if (seen[key]) { seen[key]++; return; }
+    seen[key] = 1;
+    sent++;
+    reporting = true;
     try {
       payload.kind = kind;
       payload.url = location.href;
@@ -694,8 +703,10 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
-      });
-    } catch (e) {}
+      }).catch(function () {});
+    } catch (e) {} finally {
+      reporting = false;
+    }
   }
   window.addEventListener('error', function (e) {
     report('error', { msg: String(e.message), src: e.filename, line: e.lineno, col: e.colno });

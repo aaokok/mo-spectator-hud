@@ -19,48 +19,48 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::AppState;
 
 const SAMPLE_MS: u64 = 15;
+const IDLE_SAMPLE_MS: u64 = 200;
+const KEEPALIVE_MS: u64 = 2_000;
 
 pub fn start(state: Arc<AppState>) {
     std::thread::spawn(move || {
         let mut sent_on = false;
         let mut last = (i32::MIN, i32::MIN);
+        let mut last_sent_at = Instant::now();
+        let mut sleep_ms = IDLE_SAMPLE_MS;
         loop {
-            std::thread::sleep(Duration::from_millis(SAMPLE_MS));
+            std::thread::sleep(Duration::from_millis(sleep_ms));
             if state.cursor_tx.receiver_count() == 0 {
+                sent_on = false;
+                last = (i32::MIN, i32::MIN);
+                sleep_ms = IDLE_SAMPLE_MS;
                 continue;
             }
             let (indicator_on, only_covered) = {
                 let c = state.ctrl.lock().unwrap();
                 (c.cursor_indicator, c.cursor_only_when_covered)
             };
-            let overlay = *state.overlay_hwnd.lock().unwrap();
-            let game = *state.game_hwnd.lock().unwrap();
-            /* R23：前台判据从"前台句柄 == 游戏主窗口"放宽到"前台窗口属于游戏进程"。
-               Esc/选项菜单可能是同进程的另一个顶层窗口，旧判据下这段时间前台句柄
-               不等于 game，指示器会整段消失。 */
-            let fg_is_game = if game == 0 {
-                false
-            } else {
-                let fg = crate::winutil::foreground_hwnd();
-                if fg == 0 {
-                    false
-                } else if fg == game {
-                    true
-                } else {
-                    let fp = crate::winutil::window_pid(fg);
-                    fp != 0 && fp == crate::winutil::window_pid(game)
+            let overlay = state.overlay_hwnd.load(Ordering::Relaxed);
+            let game = state.game_hwnd.load(Ordering::Relaxed);
+            if !indicator_on || game == 0 || overlay == 0 {
+                if sent_on {
+                    let _ = state.cursor_tx.send("{\"on\":false}".to_string());
+                    sent_on = false;
+                    last = (i32::MIN, i32::MIN);
                 }
-            };
-            let active = indicator_on
-                && overlay != 0
-                && state.ov_visible.load(Ordering::Relaxed)
+                sleep_ms = IDLE_SAMPLE_MS;
+                continue;
+            }
+            // 游戏在运行且指示器已开启且有订阅者 → 恢复 15ms 响应
+            sleep_ms = SAMPLE_MS;
+            let fg_is_game = crate::winutil::is_foreground_of_window_pid(game);
+            let active = state.ov_visible.load(Ordering::Relaxed)
                 && !state.ov_auto_hidden.load(Ordering::Relaxed)
-                && game != 0
                 && fg_is_game;
             if !active {
                 if sent_on {
@@ -98,7 +98,8 @@ pub fn start(state: Arc<AppState>) {
                 }
             }
 
-            if sent_on && (x, y) == last {
+            // 静止光标不重复推送，仅每 2 秒补发一次保活坐标供前端断流兜底
+            if sent_on && (x, y) == last && last_sent_at.elapsed() < Duration::from_millis(KEEPALIVE_MS) {
                 continue;
             }
             if state
@@ -108,6 +109,7 @@ pub fn start(state: Arc<AppState>) {
             {
                 sent_on = true;
                 last = (x, y);
+                last_sent_at = Instant::now();
             }
         }
     });

@@ -34,6 +34,7 @@ pub fn setup(app: &App, state: Arc<AppState>, port: u16) -> Result<(), Box<dyn s
         "http://127.0.0.1:{port}/?overlay=1&local=1&cursorregions=1&source=live&url=%2Fstate%2Fout%2Fhud_state.json"
     )
     .parse()?;
+    let st_load = state.clone();
     let overlay = WebviewWindowBuilder::new(app.handle(), "overlay", WebviewUrl::External(overlay_url))
         .title("MO HUD 覆盖层")
         .decorations(false)
@@ -44,24 +45,28 @@ pub fn setup(app: &App, state: Arc<AppState>, port: u16) -> Result<(), Box<dyn s
         .resizable(false)
         .focused(false)
         .visible(false)
-        .on_page_load(|w, payload| {
+        .on_page_load(move |w, payload| {
             if matches!(payload.event(), PageLoadEvent::Finished) {
-                let _ = w.show();
                 // tao 的 click-through：LAYERED|TRANSPARENT，但必须补 SLWA 才会被渲染
                 let _ = w.set_ignore_cursor_events(true);
                 if let Ok(h) = w.hwnd() {
                     crate::winutil::layered_commit_visible(h.0 as isize);
-                    crate::winutil::force_topmost(h.0 as isize);
+                    if st_load.ov_topmost.load(Ordering::Relaxed) {
+                        crate::winutil::force_topmost(h.0 as isize);
+                    }
                 }
+                apply_overlay_flags(&st_load);
             }
         })
         .build()?;
     let _ = overlay.set_ignore_cursor_events(true);
     if let Ok(h) = overlay.hwnd() {
         let h = h.0 as isize;
-        *state.overlay_hwnd.lock().unwrap() = h;   // R13 光标指示器坐标换算用
+        state.overlay_hwnd.store(h, Ordering::Relaxed);   // R13 光标指示器坐标换算用
         crate::winutil::layered_commit_visible(h);
-        crate::winutil::force_topmost(h);
+        if state.ov_topmost.load(Ordering::Relaxed) {
+            crate::winutil::force_topmost(h);
+        }
     }
 
     create_tray(app.handle(), port)?;
@@ -86,12 +91,16 @@ pub fn setup(app: &App, state: Arc<AppState>, port: u16) -> Result<(), Box<dyn s
 // ---------- 状态应用 ----------
 
 /// 把旗标真正落到窗口上（server 与热键共用）。
-/// R10：实际可见 = 用户开关 ov_visible && !跟随线程的失焦自动隐藏 ov_auto_hidden。
+/// R10：实际可见 = 用户开关 ov_visible && !(失焦自动隐藏 && !手动钉住)。
 pub fn apply_overlay_flags(state: &Arc<AppState>) {
+    let pinned = state.ov_user_pin.load(Ordering::Relaxed);
+    let effective_auto_hidden = state.ov_auto_hidden.load(Ordering::Relaxed) && !pinned;
+    if pinned && state.ov_auto_hidden.load(Ordering::Relaxed) {
+        state.ov_auto_hidden.store(false, Ordering::Relaxed);
+    }
     if let Some(app) = state.app.get() {
         if let Some(w) = app.get_webview_window("overlay") {
-            let v = state.ov_visible.load(Ordering::Relaxed)
-                && !state.ov_auto_hidden.load(Ordering::Relaxed);
+            let v = state.ov_visible.load(Ordering::Relaxed) && !effective_auto_hidden;
             let t = state.ov_topmost.load(Ordering::Relaxed);
             if v {
                 let _ = w.show();
@@ -116,12 +125,20 @@ pub fn focus_control(app: &AppHandle) {
 
 fn toggle_visible(app: &AppHandle) {
     let st = state_of(app);
-    let v = !st.ov_visible.load(Ordering::Relaxed);
-    st.ov_visible.store(v, Ordering::Relaxed);
-    // 手动"显示"临时钉住：游戏没聚焦也保持可见（follow 线程在游戏回到
-    // 前台时清钉）。手动"隐藏"则一并清钉，行为回到纯自动。
-    st.ov_user_pin.store(v, Ordering::Relaxed);
-    st.log(format!("覆盖窗口显隐 -> {v}"));
+    // 按当前实际可见态翻转：无论是手动隐藏还是失焦暂停，一次热键/托盘即立即固定显示；
+    // 当前正在显示时，一次即隐藏并清钉。
+    let currently_shown = st.ov_visible.load(Ordering::Relaxed)
+        && (!st.ov_auto_hidden.load(Ordering::Relaxed) || st.ov_user_pin.load(Ordering::Relaxed));
+    if currently_shown {
+        st.ov_visible.store(false, Ordering::Relaxed);
+        st.ov_user_pin.store(false, Ordering::Relaxed);
+        st.log("覆盖窗口显隐 -> false");
+    } else {
+        st.ov_visible.store(true, Ordering::Relaxed);
+        st.ov_user_pin.store(true, Ordering::Relaxed);
+        st.ov_auto_hidden.store(false, Ordering::Relaxed);
+        st.log("覆盖窗口显隐 -> true（固定显示）");
+    }
     apply_overlay_flags(&st);
 }
 
@@ -160,7 +177,7 @@ pub fn apply_hotkeys(state: &Arc<AppState>) {
     if !enabled {
         let mut st = state.hotkey_status.lock().unwrap();
         st.enabled = false;
-        st.ok = false;
+        st.ok = true;
         st.error.clear();
         drop(st);
         state.log("全局热键：已关闭");
@@ -256,7 +273,11 @@ fn create_tray(app: &AppHandle, _port: u16) -> Result<(), Box<dyn std::error::Er
             "toggle" => toggle_visible(app),
             "topmost" => toggle_topmost(app),
             "copy" => copy_obs_url(app),
-            "quit" => app.exit(0),
+            "quit" => {
+                let st = state_of(app);
+                crate::bridge::shutdown(&st);
+                app.exit(0);
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {

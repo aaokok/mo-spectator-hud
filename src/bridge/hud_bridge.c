@@ -164,6 +164,7 @@
  */
 
 #define WIN32_LEAN_AND_MEAN
+#define HUD_BRIDGE_MAIN 1
 #include <windows.h>
 #include <mmsystem.h>
 #include <stdio.h>
@@ -363,6 +364,7 @@
 #define S_IS_SUSPENDED       0x0070
 #define S_CHARGE_DRAIN_STATE 0x007C   /* v7.2：ChargeDrainState 0=Charging 1=Ready 2=Draining */
 #define SWT_RECHARGE_TIME    0x00B0
+#define SWT_USE_CHARGE_DRAIN 0x00E5   /* SuperWeaponTypeClass::UseChargeDrain（YRpp + gamemd 0x6CBEE0 实证） */
 #define SWT_MANUAL_CONTROL   0x00F5   /* v7.2：ManualControl，引擎对象字段（已含地图内嵌 ini 合并） */
 
 /* session / scenario */
@@ -409,6 +411,24 @@
 
 static HANDLE g_proc = NULL;
 static int    g_fail = 0;
+static volatile LONG g_stop = 0;
+
+static BOOL WINAPI on_ctrl_signal(DWORD ctrl_type)
+{
+    (void)ctrl_type;
+    InterlockedExchange(&g_stop, 1);
+    return TRUE;
+}
+
+static void sleep_interruptible(int total_ms)
+{
+    int rem = total_ms;
+    while (rem > 0 && !g_stop) {
+        int step = (rem > 100) ? 100 : rem;
+        Sleep((DWORD)step);
+        rem -= step;
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* 读取                                                                */
@@ -462,53 +482,231 @@ static int rd_rect(DWORD a, int *out)
     out[0] = t[0]; out[1] = t[1]; out[2] = t[2]; out[3] = t[3];
     return 1;
 }
-static void to_utf8_wide(const wchar_t *src, char *dst, int dstn);   /* 定义在后 */
-static void rd_str(DWORD a, char *dst, int n)
+/* UTF-8 序列校验与安全截断（RFC 3629）：绝不在多字节汉字中间劈裂，绝不输出非法字节 */
+static size_t utf8_char_len(const unsigned char *p, size_t rem)
 {
-    int i; char c;
-    dst[0] = 0;
-    for (i = 0; i < n - 1; ++i) {
-        if (!rd(a + i, &c, 1) || !c) break;
-        dst[i] = c; dst[i + 1] = 0;
+    unsigned char b0;
+    if (!p || rem == 0) return 0;
+    b0 = p[0];
+    if (b0 < 0x80) return 1;
+    if (b0 >= 0xC2 && b0 <= 0xDF) {
+        if (rem >= 2 && (p[1] & 0xC0) == 0x80) return 2;
+        return 0;
     }
-}
-static void rd_wstr(DWORD a, char *dst, int n)
-{
-    /* UTF-16 宽字符直读 -> UTF-8（v6：不再把 >=128 的字符降级成 '?'） */
-    wchar_t wbuf[256];
-    int i;
-    int maxc = (n > 1) ? (n - 1) : 0;
-    if (maxc > 255) maxc = 255;
-    dst[0] = 0;
-    for (i = 0; i < maxc; ++i) {
-        if (!rd(a + i * 2, &wbuf[i], 2) || !wbuf[i]) break;
+    if (b0 == 0xE0) {
+        if (rem >= 3 && p[1] >= 0xA0 && p[1] <= 0xBF && (p[2] & 0xC0) == 0x80) return 3;
+        return 0;
     }
-    wbuf[i] = 0;
-    to_utf8_wide(wbuf, dst, n);
+    if ((b0 >= 0xE1 && b0 <= 0xEC) || (b0 >= 0xEE && b0 <= 0xEF)) {
+        if (rem >= 3 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) return 3;
+        return 0;
+    }
+    if (b0 == 0xED) {
+        if (rem >= 3 && p[1] >= 0x80 && p[1] <= 0x9F && (p[2] & 0xC0) == 0x80) return 3;
+        return 0;
+    }
+    if (b0 == 0xF0) {
+        if (rem >= 4 && p[1] >= 0x90 && p[1] <= 0xBF &&
+            (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) return 4;
+        return 0;
+    }
+    if (b0 >= 0xF1 && b0 <= 0xF3) {
+        if (rem >= 4 && (p[1] & 0xC0) == 0x80 &&
+            (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) return 4;
+        return 0;
+    }
+    if (b0 == 0xF4) {
+        if (rem >= 4 && p[1] >= 0x80 && p[1] <= 0x8F &&
+            (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) return 4;
+        return 0;
+    }
+    return 0;
 }
 
-/* ANSI(GBK) / UTF-16 -> UTF-8 */
-static void to_utf8_ansi(const char *src, char *dst, int dstn)
+static int is_valid_utf8(const char *s)
 {
-    wchar_t wbuf[512];
-    int wl, ml;
-    dst[0] = 0;
-    if (!src || !src[0]) return;
-    wl = MultiByteToWideChar(CP_ACP, 0, src, -1, wbuf, 512);
-    if (wl <= 0) { lstrcpynA(dst, src, dstn); return; }
-    ml = WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, dst, dstn, NULL, NULL);
-    if (ml <= 0) dst[0] = 0;
+    const unsigned char *p = (const unsigned char *)s;
+    size_t len, i = 0;
+    if (!p) return 1;
+    len = strlen(s);
+    while (i < len) {
+        size_t cl = utf8_char_len(p + i, len - i);
+        if (cl == 0) return 0;
+        i += cl;
+    }
+    return 1;
 }
-static void to_utf8_wide(const wchar_t *src, char *dst, int dstn)
+
+static void utf8_copy_trunc(char *dst, size_t dst_cap, const char *src)
 {
-    /* 先转到大缓冲再截断：dstn 不足时 WideCharToMultiByte 会整体失败清空，不能直接用 */
-    char big[1024];
-    int ml;
+    const unsigned char *p;
+    size_t slen, i = 0, out = 0;
+    if (!dst || dst_cap == 0) return;
     dst[0] = 0;
     if (!src || !src[0]) return;
-    ml = WideCharToMultiByte(CP_UTF8, 0, src, -1, big, sizeof(big), NULL, NULL);
+    p = (const unsigned char *)src;
+    slen = strlen(src);
+    while (i < slen) {
+        size_t cl = utf8_char_len(p + i, slen - i);
+        if (cl == 0) {
+            if (out + 1 >= dst_cap) break;
+            dst[out++] = '?';
+            i += 1;
+        } else {
+            if (out + cl >= dst_cap) break;
+            memcpy(dst + out, p + i, cl);
+            out += cl;
+            i += cl;
+        }
+    }
+    dst[out] = 0;
+}
+
+static void ascii_sanitize(char *dst, size_t dst_cap, const char *src)
+{
+    size_t i = 0;
+    if (!dst || dst_cap == 0) return;
+    dst[0] = 0;
+    if (!src) return;
+    while (src[i] && i + 1 < dst_cap) {
+        unsigned char c = (unsigned char)src[i];
+        dst[i] = (c < 0x80) ? (char)c : '?';
+        ++i;
+    }
+    dst[i] = 0;
+}
+
+/* UTF-16（带显式最大宽字符上限）-> UTF-8 */
+static void to_utf8_wide_n(const wchar_t *src, size_t max_wchars, char *dst, size_t dst_cap)
+{
+    char big[1024];
+    size_t wlen = 0;
+    int ml;
+    if (!dst || dst_cap == 0) return;
+    dst[0] = 0;
+    if (!src || max_wchars == 0) return;
+    while (wlen < max_wchars && src[wlen] != 0) ++wlen;
+    if (wlen == 0) return;
+    ml = WideCharToMultiByte(CP_UTF8, 0, src, (int)wlen, big, (int)(sizeof(big) - 1), NULL, NULL);
     if (ml <= 0) return;
-    lstrcpynA(dst, big, dstn);
+    big[ml] = 0;
+    utf8_copy_trunc(dst, dst_cap, big);
+}
+
+/* ANSI(CP_ACP / GBK) -> UTF-8（游戏内存窄字符专用：ACP=936 直转 GBK，ACP=65001 时先严验 UTF-8 再兜底 CP936，失败退回 ASCII 清洗） */
+static void to_utf8_ansi(const char *src, char *dst, size_t dst_cap)
+{
+    wchar_t wbuf[520];
+    int wl = 0;
+    if (!dst || dst_cap == 0) return;
+    dst[0] = 0;
+    if (!src || !src[0]) return;
+    if (GetACP() == CP_UTF8) {
+        wl = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, src, -1, wbuf, (int)(sizeof(wbuf) / sizeof(wbuf[0])));
+        if (wl <= 0) {
+            wl = MultiByteToWideChar(936, MB_ERR_INVALID_CHARS, src, -1, wbuf, (int)(sizeof(wbuf) / sizeof(wbuf[0])));
+        }
+    }
+    if (wl <= 0) {
+        wl = MultiByteToWideChar(CP_ACP, 0, src, -1, wbuf, (int)(sizeof(wbuf) / sizeof(wbuf[0])));
+    }
+    if (wl <= 0) {
+        ascii_sanitize(dst, dst_cap, src);
+        return;
+    }
+    to_utf8_wide_n(wbuf, (size_t)(wl - 1), dst, dst_cap);
+}
+
+/* 外部 INI 文本 -> UTF-8（spawn.ini 由 C# 客户端以 UTF-8 写出，兼容手动 GBK 编辑） */
+static void to_utf8_ini(const char *src, char *dst, size_t dst_cap)
+{
+    if (!dst || dst_cap == 0) return;
+    dst[0] = 0;
+    if (!src || !src[0]) return;
+    if (is_valid_utf8(src)) {
+        utf8_copy_trunc(dst, dst_cap, src);
+        return;
+    }
+    to_utf8_ansi(src, dst, dst_cap);
+}
+
+/* 按引擎字段真实上限块读窄字符（页边界安全，避免逐字节 RPM） */
+static void rd_str_cap(DWORD a, size_t src_cap, char *dst, size_t dst_cap)
+{
+    size_t lim, pos = 0;
+    if (!dst || dst_cap == 0) return;
+    dst[0] = 0;
+    if (!a || src_cap == 0) return;
+    lim = src_cap;
+    if (lim >= dst_cap) lim = dst_cap - 1;
+    while (pos < lim) {
+        DWORD cur = a + (DWORD)pos;
+        size_t page_rem = 4096u - (size_t)(cur & 4095u);
+        size_t chunk = lim - pos;
+        char buf[64];
+        size_t j;
+        if (chunk > sizeof(buf)) chunk = sizeof(buf);
+        if (chunk > page_rem) chunk = page_rem;
+        if (!rd(cur, buf, chunk)) break;
+        for (j = 0; j < chunk; ++j) {
+            if (!buf[j]) {
+                dst[pos] = 0;
+                return;
+            }
+            dst[pos++] = buf[j];
+        }
+    }
+    dst[pos] = 0;
+}
+
+static void rd_ansi_utf8(DWORD a, size_t src_cap, char *dst, size_t dst_cap)
+{
+    char raw[520];
+    if (!dst || dst_cap == 0) return;
+    dst[0] = 0;
+    if (!a || src_cap == 0) return;
+    if (src_cap >= sizeof(raw)) src_cap = sizeof(raw) - 1;
+    rd_str_cap(a, src_cap, raw, sizeof(raw));
+    to_utf8_ansi(raw, dst, dst_cap);
+}
+
+/* 兼容旧签名包装（test_unit_count_rules.py 桩接口同签名）：按 n-1 封顶并经 ANSI->UTF-8 转码 */
+static void rd_str(DWORD a, char *dst, int n)
+{
+    if (!dst || n <= 0) return;
+    rd_ansi_utf8(a, (size_t)(n - 1), dst, (size_t)n);
+}
+
+/* 按引擎字段真实宽字符上限块读 UTF-16LE -> UTF-8（页边界安全，分离源宽字符数与目标 UTF-8 字节数） */
+static void rd_wstr_utf8(DWORD a, size_t src_wchars, char *dst, size_t dst_cap)
+{
+    wchar_t wbuf[256];
+    size_t maxc, pos = 0;
+    if (!dst || dst_cap == 0) return;
+    dst[0] = 0;
+    if (!a || src_wchars == 0) return;
+    maxc = src_wchars;
+    if (maxc > 255) maxc = 255;
+    while (pos < maxc) {
+        DWORD cur = a + (DWORD)(pos * 2);
+        size_t page_rem = 4096u - (size_t)(cur & 4095u);
+        size_t wchunk = maxc - pos;
+        size_t page_w = page_rem / 2;
+        size_t j;
+        if (wchunk > 32) wchunk = 32;
+        if (page_w == 0) wchunk = 1;
+        else if (wchunk > page_w) wchunk = page_w;
+        if (!rd(cur, wbuf + pos, wchunk * sizeof(wchar_t))) break;
+        for (j = 0; j < wchunk; ++j) {
+            if (wbuf[pos] == 0) {
+                to_utf8_wide_n(wbuf, pos, dst, dst_cap);
+                return;
+            }
+            pos++;
+        }
+    }
+    wbuf[pos] = 0;
+    to_utf8_wide_n(wbuf, pos, dst, dst_cap);
 }
 
 /* ------------------------------------------------------------------ */
@@ -533,15 +731,18 @@ static void sb_need(SB *b, size_t extra)
         if (b->p) b->cap = nc;
     }
 }
-static void sb_add(SB *b, const char *s)
+static void sb_add_n(SB *b, const char *s, size_t l)
 {
-    size_t l;
-    if (!b->p || !s) return;
-    l = strlen(s);
+    if (!b->p || !s || l == 0) return;
     sb_need(b, l);
     if (!b->p) return;
     memcpy(b->p + b->n, s, l);
     b->n += l; b->p[b->n] = 0;
+}
+static void sb_add(SB *b, const char *s)
+{
+    if (!b->p || !s) return;
+    sb_add_n(b, s, strlen(s));
 }
 static void sb_printf(SB *b, const char *f, ...)
 {
@@ -554,43 +755,83 @@ static void sb_printf(SB *b, const char *f, ...)
     tmp[sizeof(tmp) - 1] = 0;
     sb_add(b, tmp);
 }
-/* JSON 字符串（已转 UTF-8 的内容直接转义即可） */
+/* JSON 字符串（协议层最后防线：转义控制字符并校验 UTF-8 序列，非法字节一律替换 '?'） */
 static void sb_json(SB *b, const char *s)
 {
     const unsigned char *p = (const unsigned char *)s;
-    sb_add(b, "\"");
+    sb_add_n(b, "\"", 1);
     if (p) {
-        while (*p) {
-            switch (*p) {
-                case '"':  sb_add(b, "\\\""); break;
-                case '\\': sb_add(b, "\\\\"); break;
-                case '\n': sb_add(b, "\\n"); break;
-                case '\r': sb_add(b, "\\r"); break;
-                case '\t': sb_add(b, "\\t"); break;
-                default:
-                    if (*p < 0x20) sb_printf(b, "\\u%04x", *p);
-                    else { char c[2]; c[0] = (char)*p; c[1] = 0; sb_add(b, c); }
+        size_t len = strlen(s), i = 0;
+        while (i < len) {
+            unsigned char c = p[i];
+            if (c >= 0x20 && c < 0x80 && c != '"' && c != '\\') {
+                size_t start = i;
+                while (i < len && p[i] >= 0x20 && p[i] < 0x80 && p[i] != '"' && p[i] != '\\') {
+                    ++i;
+                }
+                sb_add_n(b, (const char *)(p + start), i - start);
+            } else if (c >= 0x80) {
+                size_t cl = utf8_char_len(p + i, len - i);
+                if (cl > 0) {
+                    sb_add_n(b, (const char *)(p + i), cl);
+                    i += cl;
+                } else {
+                    sb_add_n(b, "?", 1);
+                    i += 1;
+                }
+            } else {
+                switch (c) {
+                    case '"':  sb_add_n(b, "\\\"", 2); break;
+                    case '\\': sb_add_n(b, "\\\\", 2); break;
+                    case '\n': sb_add_n(b, "\\n", 2); break;
+                    case '\r': sb_add_n(b, "\\r", 2); break;
+                    case '\t': sb_add_n(b, "\\t", 2); break;
+                    default:   sb_printf(b, "\\u%04x", c); break;
+                }
+                ++i;
             }
-            ++p;
         }
     }
-    sb_add(b, "\"");
+    sb_add_n(b, "\"", 1);
 }
 
-/* 原子写：先写 .tmp 再替换，避免 OBS 读到半截文件 */
+/* 原子写：先写 .tmp 并完整刷盘关闭，再带短退避 MoveFileExA 替换，绝不删旧目标文件 */
 static int write_atomic(const char *path, const char *data, size_t len)
 {
-    char tmp[MAX_PATH + 8];
+    char tmp[MAX_PATH + 16];
     FILE *f;
+    size_t plen;
+    int attempt, moved = 0;
     if (!path || !path[0]) return 0;
-    sprintf(tmp, "%s.tmp", path);
+    plen = strlen(path);
+    if (plen + 5 > sizeof(tmp)) return 0;
+    _snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    tmp[sizeof(tmp) - 1] = 0;
     f = fopen(tmp, "wb");
     if (!f) return 0;
-    if (len && fwrite(data, 1, len, f) != len) { fclose(f); DeleteFileA(tmp); return 0; }
-    fclose(f);
-    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
-        DeleteFileA(path);
-        if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) { DeleteFileA(tmp); return 0; }
+    if ((len && fwrite(data, 1, len, f) != len) || fflush(f) != 0) {
+        fclose(f);
+        DeleteFileA(tmp);
+        return 0;
+    }
+    if (fclose(f) != 0) {
+        DeleteFileA(tmp);
+        return 0;
+    }
+    for (attempt = 0; attempt < 5; ++attempt) {
+        if (MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            moved = 1;
+            break;
+        }
+        {
+            DWORD err = GetLastError();
+            if (err != ERROR_ACCESS_DENIED && err != ERROR_SHARING_VIOLATION) break;
+        }
+        Sleep(5);
+    }
+    if (!moved) {
+        DeleteFileA(tmp);
+        return 0;
     }
     return 1;
 }
@@ -628,27 +869,131 @@ static const char *install_dir(void)
     return buf;
 }
 
-/* 读 spawn.ini 的 StolenTech= 开关（v6.7）。
-   为什么必须读文件：Ares 只在 StolenTech=True 时才合并 Stolen Tech.ini，
-   关掉后 11 个科技建筑全部回落 Spyable=no —— 也就是「渗透事件根本不会发生」，
-   而不是「偷了但没解锁」。只看掩码为 0 无法区分这两种状态，
-   渲染端会误导观众以为「这局没人渗透」。
-   返回 1=读到且为 true，0=读到 false 或读不到（读不到按关闭处理，宁可不显示）。 */
-static int read_stolentech_option(void)
+/* 缓存当前对局的 spawn.ini 字段（StolenTech= 与 UIMapName=）：
+   1) StolenTech=：Ares 只在 StolenTech=True 时合并 Stolen Tech.ini（v6.7）。
+   2) UIMapName=：MO 3.3.6 通过 spawnmap.ini 启动时，引擎内存 ScenarioClass::Name/UIName
+      均为空（spawnmap.ini 不在 missionmd.ini 中），真实中英文地图名在 spawn.ini 的
+      [Settings] UIMapName=（CnCNet 客户端以 UTF-8 写出，兼容 GBK 手动编辑）。
+   按 g_proc 进程 PID 缓存，仅在挂载新进程或新对局（frame 回退）时读一次盘，
+   优先从 g_proc 自身可执行目录（UTF-16 路径）拼 spawn.ini，避免注册表指向旧目录。 */
+static DWORD g_spawn_pid = 0;
+static DWORD g_spawn_last_frame = 0;
+static int   g_spawn_stolen_tech = 0;
+static char  g_spawn_ui_map_name[192];
+
+static void reset_spawn_ini_cache(void)
 {
-    char ini[MAX_PATH], buf[32];
-    const char *dir = install_dir();
-    if (!dir || !dir[0]) return 0;
-    _snprintf(ini, sizeof(ini), "%s/spawn.ini", dir);
-    ini[sizeof(ini) - 1] = 0;
-    buf[0] = 0;
-    GetPrivateProfileStringA("Settings", "StolenTech", "", buf, sizeof(buf), ini);
-    /* MO 的 spawn.ini 里该键在 [Settings] 段；键名大小写不敏感，值可能是 True/yes/1 */
-    if (!buf[0]) {
-        GetPrivateProfileStringA(NULL, "StolenTech", "", buf, sizeof(buf), ini);
+    g_spawn_pid = 0;
+    g_spawn_last_frame = 0;
+    g_spawn_stolen_tech = 0;
+    g_spawn_ui_map_name[0] = 0;
+}
+
+static FILE *open_spawn_ini_for_proc(void)
+{
+    wchar_t wpath[MAX_PATH * 2];
+    DWORD wn = (DWORD)(sizeof(wpath) / sizeof(wpath[0]));
+    FILE *f = NULL;
+
+    if (g_proc && QueryFullProcessImageNameW(g_proc, 0, wpath, &wn) && wn > 0) {
+        wchar_t *slash = wcsrchr(wpath, L'\\');
+        wchar_t *fslash = wcsrchr(wpath, L'/');
+        if (fslash && (!slash || fslash > slash)) slash = fslash;
+        if (slash && (size_t)(slash - wpath) + 12 < (sizeof(wpath) / sizeof(wpath[0]))) {
+            wcscpy(slash + 1, L"spawn.ini");
+            f = _wfopen(wpath, L"rb");
+        }
     }
-    if (!buf[0]) return 0;
-    return (!_stricmp(buf, "true") || !_stricmp(buf, "yes") || !strcmp(buf, "1")) ? 1 : 0;
+    if (!f) {
+        const char *dir = install_dir();
+        if (dir && dir[0]) {
+            char ini[MAX_PATH + 16];
+            _snprintf(ini, sizeof(ini), "%s/spawn.ini", dir);
+            ini[sizeof(ini) - 1] = 0;
+            f = fopen(ini, "rb");
+        }
+    }
+    return f;
+}
+
+static void parse_spawn_ini_stream(FILE *f, int *out_stolen_tech, char *out_map_name, size_t out_map_cap)
+{
+    char line[1024];
+    int in_settings = 0;
+    int first_line = 1;
+    if (out_stolen_tech) *out_stolen_tech = 0;
+    if (out_map_name && out_map_cap > 0) out_map_name[0] = 0;
+    if (!f) return;
+
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        size_t len;
+        if (first_line) {
+            first_line = 0;
+            if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) {
+                p += 3;
+            }
+        }
+        while (*p == ' ' || *p == '\t') ++p;
+        len = strlen(p);
+        while (len > 0 && (p[len - 1] == '\r' || p[len - 1] == '\n' ||
+                           p[len - 1] == ' '  || p[len - 1] == '\t')) {
+            p[--len] = 0;
+        }
+        if (!p[0] || p[0] == ';' || p[0] == '#') continue;
+        if (p[0] == '[') {
+            char *rb = strchr(p + 1, ']');
+            if (rb) {
+                *rb = 0;
+                in_settings = (_stricmp(p + 1, "Settings") == 0);
+            }
+            continue;
+        }
+        if (!in_settings) continue;
+        {
+            char *eq = strchr(p, '=');
+            char *key, *val;
+            size_t klen;
+            if (!eq) continue;
+            *eq = 0;
+            key = p;
+            klen = strlen(key);
+            while (klen > 0 && (key[klen - 1] == ' ' || key[klen - 1] == '\t')) key[--klen] = 0;
+            val = eq + 1;
+            while (*val == ' ' || *val == '\t') ++val;
+            if (!_stricmp(key, "StolenTech")) {
+                if (out_stolen_tech) {
+                    *out_stolen_tech = (!_stricmp(val, "true") || !_stricmp(val, "yes") || !strcmp(val, "1")) ? 1 : 0;
+                }
+            } else if (!_stricmp(key, "UIMapName")) {
+                if (out_map_name && out_map_cap > 0) {
+                    to_utf8_ini(val, out_map_name, out_map_cap);
+                }
+            }
+        }
+    }
+}
+
+static void refresh_spawn_ini_cache(DWORD cur_frame)
+{
+    DWORD pid;
+    if (!g_proc) {
+        reset_spawn_ini_cache();
+        return;
+    }
+    pid = GetProcessId(g_proc);
+    if (!pid) return;
+    if (pid != g_spawn_pid || (cur_frame < g_spawn_last_frame && cur_frame < 60)) {
+        FILE *f = open_spawn_ini_for_proc();
+        g_spawn_stolen_tech = 0;
+        g_spawn_ui_map_name[0] = 0;
+        if (f) {
+            parse_spawn_ini_stream(f, &g_spawn_stolen_tech, g_spawn_ui_map_name, sizeof(g_spawn_ui_map_name));
+            fclose(f);
+        }
+        g_spawn_pid = pid;
+    }
+    g_spawn_last_frame = cur_frame;
 }
 
 /* 该 pid 的 exe 全路径是否位于 MO 安装目录下。读不到路径就当"不是"。 */
@@ -671,33 +1016,58 @@ static int proc_in_install_dir(DWORD pid)
     return hit;
 }
 
-/* 枚举所有进程，按 exe 名匹配（不区分大小写）。返回找到的第一个 pid。
-   多实例时优先选 exe 全路径位于 MO 安装目录下的那个——原版 YR 的 gamemd.exe
-   与本二进制同 MD5、同 TimeDateStamp，preflight 无法区分，只能靠路径。 */
-static DWORD find_proc_by_name(const char *name, int prefer_install_dir)
+/* 单次进程快照同时查找游戏进程（优先 MO 安装目录）与 MO 客户端进程，
+   将空闲态的 5 次全系统快照/秒压为 1 次。 */
+static void scan_game_and_client(DWORD *out_game_pid, DWORD *out_client_pid)
 {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    HANDLE snap;
     PROCESSENTRY32 pe;
-    DWORD pid = 0, fallback = 0;
-    if (snap == INVALID_HANDLE_VALUE) return 0;
+    DWORD gm_dir = 0, gm_fb = 0;
+    DWORD sp_dir = 0, sp_fb = 0;
+    DWORD cli_pid = 0;
+
+    if (out_game_pid) *out_game_pid = 0;
+    if (out_client_pid) *out_client_pid = 0;
+
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
     pe.dwSize = sizeof(pe);
     if (Process32First(snap, &pe)) {
         do {
-            if (_stricmp(pe.szExeFile, name)) continue;
-            if (!prefer_install_dir) { pid = pe.th32ProcessID; break; }
-            if (!fallback) fallback = pe.th32ProcessID;
-            if (proc_in_install_dir(pe.th32ProcessID)) { pid = pe.th32ProcessID; break; }
+            if (out_game_pid && !gm_dir) {
+                if (!_stricmp(pe.szExeFile, "gamemd.exe")) {
+                    if (!gm_fb) gm_fb = pe.th32ProcessID;
+                    if (proc_in_install_dir(pe.th32ProcessID)) gm_dir = pe.th32ProcessID;
+                } else if (!sp_dir && !_stricmp(pe.szExeFile, "gamemd-spawn.exe")) {
+                    if (!sp_fb) sp_fb = pe.th32ProcessID;
+                    if (proc_in_install_dir(pe.th32ProcessID)) sp_dir = pe.th32ProcessID;
+                }
+            }
+            if (out_client_pid && !cli_pid) {
+                if (!_stricmp(pe.szExeFile, "clientdx.exe") ||
+                    !_stricmp(pe.szExeFile, "clientogl.exe") ||
+                    !_stricmp(pe.szExeFile, "clientxna.exe")) {
+                    cli_pid = pe.th32ProcessID;
+                }
+            }
+            if ((!out_game_pid || gm_dir) && (!out_client_pid || cli_pid)) break;
         } while (Process32Next(snap, &pe));
     }
     CloseHandle(snap);
-    return pid ? pid : fallback;
+
+    if (out_game_pid) {
+        if (gm_dir) *out_game_pid = gm_dir;
+        else if (gm_fb) *out_game_pid = gm_fb;
+        else if (sp_dir) *out_game_pid = sp_dir;
+        else *out_game_pid = sp_fb;
+    }
+    if (out_client_pid) *out_client_pid = cli_pid;
 }
 
 static DWORD find_gamemd(void)
 {
-    DWORD pid;
-    pid = find_proc_by_name("gamemd.exe", 1);
-    if (!pid) pid = find_proc_by_name("gamemd-spawn.exe", 1);
+    DWORD pid = 0;
+    scan_game_and_client(&pid, NULL);
     return pid;
 }
 
@@ -705,11 +1075,9 @@ static DWORD find_gamemd(void)
    MentalOmegaClient.exe 是引导器，起完 clientdx 就退出，不能拿它判断。 */
 static DWORD find_client(void)
 {
-    DWORD pid;
-    if ((pid = find_proc_by_name("clientdx.exe", 0)) != 0) return pid;
-    if ((pid = find_proc_by_name("clientogl.exe", 0)) != 0) return pid;
-    if ((pid = find_proc_by_name("clientxna.exe", 0)) != 0) return pid;
-    return 0;
+    DWORD pid = 0;
+    scan_game_and_client(NULL, &pid);
+    return pid;
 }
 
 static int preflight(HANDLE h)
@@ -917,7 +1285,7 @@ struct Snap {
     /* v7.0/R22：Esc/选项菜单。menu_open=两条信号的或；两个原始值同时输出，
        真机时用它判断到底哪条在起作用（都恒 0 说明这个界面两者都不是）。 */
     int   menu_open, menu_dialogs, menu_od;
-    char  map_name[128], map_uiname[64], map_file[260], session_file[260];
+    char  map_name[192], map_uiname[128], map_file[384], session_file[384];
     int   money, speed, ai_players, ai_diff, bases, bridges, crates, shortgame, allies;
     int   stolen_tech_enabled;                /* spawn.ini 的 StolenTech=（v6.7） */
     int   is_observer, observer_mode;
@@ -938,8 +1306,170 @@ struct Snap {
     int   uagg_skipped;                       /* Spawned 子机及计数配置排除的对象数 */
     struct PlayerRec players[MAX_HOUSES];
     int   nnode;
-    char  node_names[8][64];
+    char  node_names[8][96];
 };
+
+/* ------------------------------------------------------------------ */
+/* 进程级元数据缓存（随 g_proc 切换或帧号回退清空，避免每帧重复 RPM）   */
+/* ------------------------------------------------------------------ */
+#define TTYPE_CACHE_CAP   1024u
+#define SWTYPE_CACHE_CAP  512u
+#define SDRAIN_CACHE_CAP  256u
+
+struct TTypeCacheEnt {
+    DWORD ptr;
+    char  id[32];
+    BYTE  spawned;
+    int   strength;
+};
+
+struct SWTypeCacheEnt {
+    DWORD ptr;
+    char  id[48];
+    int   recharge_time;
+    BYTE  manual_control;
+    BYTE  use_charge_drain;
+};
+
+struct SDrainCacheEnt {
+    DWORD ptr;
+    int   drain_dt;
+};
+
+static struct TTypeCacheEnt  g_ttype_cache[TTYPE_CACHE_CAP];
+static struct SWTypeCacheEnt g_swtype_cache[SWTYPE_CACHE_CAP];
+static struct SDrainCacheEnt g_sdrain_cache[SDRAIN_CACHE_CAP];
+static DWORD g_cache_pid = 0;
+static DWORD g_cache_last_frame = 0;
+
+static void reset_proc_caches(void)
+{
+    memset(g_ttype_cache, 0, sizeof(g_ttype_cache));
+    memset(g_swtype_cache, 0, sizeof(g_swtype_cache));
+    memset(g_sdrain_cache, 0, sizeof(g_sdrain_cache));
+    g_cache_pid = 0;
+    g_cache_last_frame = 0;
+}
+
+static void sync_proc_caches(DWORD cur_frame)
+{
+    DWORD pid = g_proc ? GetProcessId(g_proc) : 0;
+    if (!pid || pid != g_cache_pid || (cur_frame < g_cache_last_frame && cur_frame < 60)) {
+        reset_proc_caches();
+        g_cache_pid = pid;
+    }
+    g_cache_last_frame = cur_frame;
+}
+
+static DWORD ptr_hash(DWORD ptr)
+{
+    DWORD h = ptr ^ (ptr >> 16);
+    h *= 0x45D9F3Bu;
+    return h ^ (h >> 16);
+}
+
+static const struct TTypeCacheEnt *ttype_cache_get(DWORD type)
+{
+    DWORD slot, step;
+    if (!type) return NULL;
+    slot = ptr_hash(type) & (TTYPE_CACHE_CAP - 1u);
+    for (step = 0; step < TTYPE_CACHE_CAP; ++step) {
+        struct TTypeCacheEnt *e = &g_ttype_cache[(slot + step) & (TTYPE_CACHE_CAP - 1u)];
+        if (e->ptr == type) return e;
+        if (e->ptr == 0) {
+            BYTE spawned = 0;
+            int strength = 0;
+            memset(e, 0, sizeof(*e));
+            rd_u8(type + TY_SPAWNED, &spawned);
+            rd_ansi_utf8(type + T_ID, 24, e->id, sizeof(e->id));
+            rd_i32(type + TY_STRENGTH, &strength);
+            e->spawned = spawned;
+            e->strength = strength;
+            e->ptr = type;
+            return e;
+        }
+    }
+    /* 表满兜底（罕见）：现读但不写槽 */
+    {
+        static struct TTypeCacheEnt fallback;
+        BYTE spawned = 0;
+        int strength = 0;
+        memset(&fallback, 0, sizeof(fallback));
+        rd_u8(type + TY_SPAWNED, &spawned);
+        rd_ansi_utf8(type + T_ID, 24, fallback.id, sizeof(fallback.id));
+        rd_i32(type + TY_STRENGTH, &strength);
+        fallback.spawned = spawned;
+        fallback.strength = strength;
+        fallback.ptr = type;
+        return &fallback;
+    }
+}
+
+static const struct SWTypeCacheEnt *swtype_cache_get(DWORD stype)
+{
+    DWORD slot, step;
+    if (!stype) return NULL;
+    slot = ptr_hash(stype) & (SWTYPE_CACHE_CAP - 1u);
+    for (step = 0; step < SWTYPE_CACHE_CAP; ++step) {
+        struct SWTypeCacheEnt *e = &g_swtype_cache[(slot + step) & (SWTYPE_CACHE_CAP - 1u)];
+        if (e->ptr == stype) return e;
+        if (e->ptr == 0) {
+            int rt = 0;
+            BYTE mc = 1, ucd = 0;
+            memset(e, 0, sizeof(*e));
+            rd_i32(stype + SWT_RECHARGE_TIME, &rt);
+            rd_u8(stype + SWT_MANUAL_CONTROL, &mc);
+            rd_u8(stype + SWT_USE_CHARGE_DRAIN, &ucd);
+            rd_ansi_utf8(stype + T_ID, 24, e->id, sizeof(e->id));
+            e->recharge_time = rt;
+            e->manual_control = mc ? 1 : 0;
+            e->use_charge_drain = ucd ? 1 : 0;
+            e->ptr = stype;
+            return e;
+        }
+    }
+    {
+        static struct SWTypeCacheEnt fallback;
+        int rt = 0;
+        BYTE mc = 1, ucd = 0;
+        memset(&fallback, 0, sizeof(fallback));
+        rd_i32(stype + SWT_RECHARGE_TIME, &rt);
+        rd_u8(stype + SWT_MANUAL_CONTROL, &mc);
+        rd_u8(stype + SWT_USE_CHARGE_DRAIN, &ucd);
+        rd_ansi_utf8(stype + T_ID, 24, fallback.id, sizeof(fallback.id));
+        fallback.recharge_time = rt;
+        fallback.manual_control = mc ? 1 : 0;
+        fallback.use_charge_drain = ucd ? 1 : 0;
+        fallback.ptr = stype;
+        return &fallback;
+    }
+}
+
+/* 记录每个 SuperClass* 在 drain==2 期间的完整维持时长（Pause/Resume 会缩小 TimeLeft） */
+static int sdrain_cache_update(DWORD sp, int is_draining, int raw_left)
+{
+    DWORD slot, step;
+    if (!sp) return is_draining ? raw_left : 0;
+    slot = ptr_hash(sp) & (SDRAIN_CACHE_CAP - 1u);
+    for (step = 0; step < SDRAIN_CACHE_CAP; ++step) {
+        struct SDrainCacheEnt *e = &g_sdrain_cache[(slot + step) & (SDRAIN_CACHE_CAP - 1u)];
+        if (e->ptr == sp) {
+            if (!is_draining) {
+                e->drain_dt = 0;
+                return 0;
+            }
+            if (raw_left > e->drain_dt) e->drain_dt = raw_left;
+            return e->drain_dt;
+        }
+        if (e->ptr == 0) {
+            if (!is_draining) return 0;
+            e->ptr = sp;
+            e->drain_dt = (raw_left > 0) ? raw_left : 0;
+            return e->drain_dt;
+        }
+    }
+    return is_draining ? raw_left : 0;
+}
 
 /* 基地质心 */
 static DWORD g_cent_owner[MAX_HOUSES];
@@ -949,6 +1479,7 @@ static int g_cent_cnt;
 
 static void compute_centers(DWORD *houses, DWORD n)
 {
+    static DWORD bops[8192];
     DWORD items = 0, count = 0, i, k;
     g_cent_cnt = (int)((n < MAX_HOUSES) ? n : MAX_HOUSES);
     for (k = 0; k < (DWORD)g_cent_cnt; ++k) {
@@ -957,19 +1488,22 @@ static void compute_centers(DWORD *houses, DWORD n)
     }
     if (!rd_u32(A_BUILDING_ARRAY_ITEMS, &items) || !items) return;
     if (!rd_u32(A_BUILDING_ARRAY_COUNT, &count) || count == 0 || count > 8192) return;
+    if (!rd(items, bops, count * sizeof(DWORD))) return;
     for (i = 0; i < count; ++i) {
-        DWORD op = 0, owner = 0;
-        BYTE alive = 0, limbo = 0;
-        int x = 0, y = 0;
-        if (!rd_u32(items + i * 4, &op) || !op) continue;
-        rd_u8(op + O_IS_ALIVE, &alive);
-        rd_u8(op + O_IN_LIMBO, &limbo);
+        DWORD op = bops[i], owner = 0;
+        unsigned char blk[0x1A0]; /* [0x80..0x220): IN_LIMBO(0x81), IS_ALIVE(0x90), LOCATION(0x9C), OWNER(0x21C) */
+        BYTE alive, limbo;
+        int x, y;
+        if (!op) continue;
+        if (!rd(op + 0x80, blk, sizeof(blk))) continue;
+        limbo = blk[O_IN_LIMBO - 0x80];
+        alive = blk[O_IS_ALIVE - 0x80];
         if (!alive || limbo) continue;
-        rd_u32(op + O_OWNER, &owner);
+        memcpy(&owner, blk + (O_OWNER - 0x80), sizeof(owner));
         for (k = 0; k < (DWORD)g_cent_cnt; ++k) {
             if (g_cent_owner[k] != owner) continue;
-            rd_i32(op + O_LOCATION + 0, &x);
-            rd_i32(op + O_LOCATION + 4, &y);
+            memcpy(&x, blk + (O_LOCATION - 0x80) + 0, sizeof(x));
+            memcpy(&y, blk + (O_LOCATION - 0x80) + 4, sizeof(y));
             g_cent_sx[k] += x; g_cent_sy[k] += y; g_cent_n[k]++;
             break;
         }
@@ -1059,8 +1593,14 @@ static void uagg_add(DWORD owner, DWORD type, const char *id, int hp, int vet)
 static void unit_scan_array(DWORD array_addr, DWORD type_off, DWORD *houses, DWORD nhouses)
 {
     DWORD items = 0, count = 0, i, k;
+#ifdef HUD_BRIDGE_MAIN
+    static DWORD ops[8192];
+#endif
     if (!rd_u32(array_addr + V_ITEMS, &items) || !items) return;
     if (!rd_u32(array_addr + V_COUNT, &count) || count == 0 || count > 8192) return;
+#ifdef HUD_BRIDGE_MAIN
+    if (!rd(items, ops, count * sizeof(DWORD))) return;
+#endif
     for (i = 0; i < count; ++i) {
         DWORD op = 0, owner = 0, type = 0, carrier = 0;
         BYTE alive = 0, limbo = 0;
@@ -1068,6 +1608,33 @@ static void unit_scan_array(DWORD array_addr, DWORD type_off, DWORD *houses, DWO
         float fvet = 0.0f;
         int in_houses = 0;
         char id[32];
+#ifdef HUD_BRIDGE_MAIN
+        unsigned char obj_blk[0x1B4]; /* [0x6C..0x220): HEALTH, IN_LIMBO, IS_ALIVE, TRANSPORTER, VETERANCY, OWNER */
+        const struct TTypeCacheEnt *tc;
+        op = ops[i];
+        if (!op) continue;
+        if (!rd(op + 0x6C, obj_blk, sizeof(obj_blk))) continue;
+        alive = obj_blk[O_IS_ALIVE - 0x6C];
+        limbo = obj_blk[O_IN_LIMBO - 0x6C];
+        if (!alive) continue;
+        if (limbo) {
+            memcpy(&carrier, obj_blk + (O_TRANSPORTER - 0x6C), sizeof(carrier));
+            if (!carrier) continue;
+        }
+        memcpy(&owner, obj_blk + (O_OWNER - 0x6C), sizeof(owner));
+        for (k = 0; k < nhouses; ++k) if (houses[k] == owner) { in_houses = 1; break; }
+        if (!in_houses) continue;
+        if (!rd_u32(op + type_off, &type) || !type) continue;
+        tc = ttype_cache_get(type);
+        if (!tc) continue;
+        if (tc->spawned) { g_uagg_skipped++; continue; }
+        if (!tc->id[0]) continue;
+        lstrcpynA(id, tc->id, sizeof(id));
+        if (unit_count_excluded(id, limbo, carrier)) { g_uagg_skipped++; continue; }
+        morph_normalize(id, sizeof(id));
+        memcpy(&hp, obj_blk + (O_HEALTH - 0x6C), sizeof(hp));
+        memcpy(&fvet, obj_blk + (O_VETERANCY - 0x6C), sizeof(fvet));
+#else
         if (!rd_u32(items + i * 4, &op) || !op) continue;
         rd_u8(op + O_IS_ALIVE, &alive);
         rd_u8(op + O_IN_LIMBO, &limbo);
@@ -1089,7 +1656,7 @@ static void unit_scan_array(DWORD array_addr, DWORD type_off, DWORD *houses, DWO
             if (rd_u8(type + TY_SPAWNED, &spawned) && spawned) { g_uagg_skipped++; continue; }
         }
         id[0] = 0;
-        rd_str(type + T_ID, id, sizeof(id));
+        rd_str(type + T_ID, id, 25);
         if (!id[0]) continue;
         /* 配置闸：原始 ID 精确匹配；Spawned 基础过滤不受 normal 覆盖。 */
         if (unit_count_excluded(id, limbo, carrier)) { g_uagg_skipped++; continue; }
@@ -1099,6 +1666,7 @@ static void unit_scan_array(DWORD array_addr, DWORD type_off, DWORD *houses, DWO
            实测 4165 个多单位样本里 4130 个 hp 恰好等于单个单位的满血。 */
         rd_i32(op + O_HEALTH, &hp);
         rd_f32(op + O_VETERANCY, &fvet);        /* v6.5：+0x150 是 float，不是 double */
+#endif
         vet = (fvet >= 1.5f) ? 2 : ((fvet >= 0.5f) ? 1 : 0);   /* 2=精英 1=老兵 0=新兵 */
         /* 归一后与同主形态聚合（type 指针不同的两形态会开两条目，按 id 再并一次） */
         {
@@ -1143,9 +1711,11 @@ static void collect_unit_types(DWORD *houses, DWORD count, struct Snap *s)
         if (!p->ptr) continue;
         for (j = 0; j < g_uagg_n && p->nunit_types < MAX_UNITTYPES; ++j) {
             struct UnitTypeRec *u;
+            const struct TTypeCacheEnt *tc;
             int maxhp = 0;
             if (g_uagg[j].owner != p->ptr) continue;
-            rd_i32(g_uagg[j].type + TY_STRENGTH, &maxhp);
+            tc = ttype_cache_get(g_uagg[j].type);
+            if (tc) maxhp = tc->strength;
             u = &p->unit_types[p->nunit_types++];
             memset(u, 0, sizeof(*u));
             lstrcpynA(u->id, g_uagg[j].id, sizeof(u->id));
@@ -1179,16 +1749,20 @@ static int super_cameo_hidden(const char *id)
 /* 超武：全局扫描，只保留 IsPresent=1 */
 static int collect_supers(DWORD frame, struct SuperRec *out, int maxn)
 {
+    static DWORD sops[4096];
+    static unsigned char blk[0x90];
     DWORD items = 0, count = 0, i;
     int n = 0;
-    static unsigned char blk[0x90];
     if (!rd_u32(A_SUPER_ARRAY + V_ITEMS, &items) || !items) return 0;
     if (!rd_u32(A_SUPER_ARRAY + V_COUNT, &count) || count == 0 || count > 4096) return 0;
+    if (!rd(items, sops, count * sizeof(DWORD))) return 0;
     for (i = 0; i < count && n < maxn; ++i) {
-        DWORD sp = 0, stype = 0, owner = 0;
-        int custom = -1, total = 0, start = 0, left = 0, pct = 0;
-        int present = 0, ready = 0, susp = 0, drain = 0, manual = 1;
-        if (!rd_u32(items + i * 4, &sp) || !sp) continue;
+        DWORD sp = sops[i], stype = 0, owner = 0;
+        const struct SWTypeCacheEnt *swc = NULL;
+        int custom = -1, total = 0, start = 0, left = 0, rem = 0, pct = 0;
+        int present = 0, ready = 0, eff_ready = 0, eff_left = 0, susp = 0, drain = 0;
+        int manual = 1, use_cd = 0;
+        if (!sp) continue;
         if (!rd(sp, blk, sizeof(blk))) continue;
         present = *(unsigned char *)(blk + S_IS_PRESENT);
         if (!present) continue;
@@ -1201,44 +1775,71 @@ static int collect_supers(DWORD frame, struct SuperRec *out, int maxn)
         ready = *(unsigned char *)(blk + S_IS_READY);
         susp = *(unsigned char *)(blk + S_IS_SUSPENDED);
         drain = *(int *)(blk + S_CHARGE_DRAIN_STATE);
+        if (stype) swc = swtype_cache_get(stype);
         if (custom > 0) total = custom;
-        else if (stype) rd_i32(stype + SWT_RECHARGE_TIME, &total);
-        /* ManualControl（Type+0xF5）是类型级"需手动起充"标志，不是"某玩家能否发射"。
-           反汇编佐证：sub_6CB4EF 里 MC==0 时引擎自动起充，MC!=0 时跳过等玩家点。
-           同类型对象全玩家共享，因此它无法表达玩家差异 —— 采集但不过滤。 */
-        if (stype) { unsigned char mc = 1; rd_u8(stype + SWT_MANUAL_CONTROL, &mc); manual = mc ? 1 : 0; }
+        else if (swc) total = swc->recharge_time;
+        if (swc) {
+            manual = swc->manual_control ? 1 : 0;
+            use_cd = swc->use_charge_drain ? 1 : 0;
+        }
         out[n].owner = owner;
-        out[n].id[0] = 0;
-        if (stype) rd_str(stype + T_ID, out[n].id, sizeof(out[n].id));
-        if (!out[n].id[0]) strcpy(out[n].id, "?");
-        /* drain 态（火风暴/电池类运作中）的 pct 语义：原版侧栏画的是"剩余运作时间"，
-           从 100 往下走。分母直接用引擎自己的计时器预算 —— TimerStruct::Start(duration)
-           把 TimeLeft 写成时长、之后再不递减，所以 draining 期间的 raw TimeLeft 就是
-           维持时长本身（Ares 激活时调的就是 Start(drainDuration)）。
-           这样不需要跨模块读 Ares 的 ChargeToDrainRatio，也不怕地图内嵌 ini 改了 ratio。 */
-        out[n].drain_total = total;
-        if (drain == 2 && start != -1 && left > 0) {
-            int dt = left;                 /* 引擎给的维持时长（帧） */
-            int rem = left - ((int)frame - start);
+        if (swc && swc->id[0]) lstrcpynA(out[n].id, swc->id, sizeof(out[n].id));
+        else strcpy(out[n].id, "?");
+
+        rem = left;
+        if (start != -1) {
+            rem = left - ((int)frame - start);
             if (rem < 0) rem = 0;
-            pct = (int)(100.0 * (double)rem / (double)dt);
-            if (pct < 0) pct = 0;
-            if (pct > 100) pct = 100;
+        } else if (rem < 0) {
+            rem = 0;
+        }
+
+        /* drain==2（火风暴/电池类运作中）：
+           使用按 SuperClass* 缓存的维持时长 dt（避免 Pause/Resume 缩小 TimeLeft
+           或断电 start==-1 落入 ready 分支导致 pct 跳回 100%）。
+           当 drain!=2 但 use_charge_drain 且 rem>0 时，Ares 停用回充不清 IsReady，
+           必须按回充进度计算并将 ready 置 0。 */
+        out[n].drain_total = total;
+        if (drain == 2) {
+            int dt = sdrain_cache_update(sp, 1, left);
+            if (dt <= 0) dt = (left > 0) ? left : total;
             out[n].drain_total = dt;
-        } else if (ready) {
-            pct = 100;
-        } else if (total > 0) {
-            int rem = left;
-            if (start != -1) { rem = left - ((int)frame - start); if (rem < 0) rem = 0; }
-            pct = (int)(100.0 * (double)(total - rem) / (double)total);
-            if (pct < 0) pct = 0;
-            if (pct > 100) pct = 100;
+            if (dt > 0) {
+                pct = (int)(100.0 * (double)rem / (double)dt);
+                if (pct < 0) pct = 0;
+                if (pct > 100) pct = 100;
+            }
+            eff_ready = ready;
+            eff_left = rem;
+        } else {
+            sdrain_cache_update(sp, 0, 0);
+            if (use_cd && rem > 0 && total > 0) {
+                pct = (int)(100.0 * (double)(total - rem) / (double)total);
+                if (pct < 0) pct = 0;
+                if (pct > 100) pct = 100;
+                eff_ready = 0;
+                eff_left = rem;
+            } else if (ready) {
+                pct = 100;
+                eff_ready = 1;
+                eff_left = 0;
+            } else if (total > 0) {
+                pct = (int)(100.0 * (double)(total - rem) / (double)total);
+                if (pct < 0) pct = 0;
+                if (pct > 100) pct = 100;
+                eff_ready = 0;
+                eff_left = rem;
+            } else {
+                pct = 0;
+                eff_ready = 0;
+                eff_left = rem;
+            }
         }
         out[n].pct = pct;
-        out[n].ready = ready;
+        out[n].ready = eff_ready;
         out[n].suspended = susp;
         out[n].total = total;
-        out[n].left = left;
+        out[n].left = eff_left;
         out[n].drain = (drain >= 0 && drain <= 2) ? drain : -1;
         out[n].manual = manual;
         out[n].hidden = super_cameo_hidden(out[n].id);
@@ -1269,13 +1870,15 @@ static DWORD type_of_object(DWORD obj)
     return type;
 }
 
-/* 类型对象 → ID（形态归一，与 unit_types 同口径）。rd_str 无返回值，先读再判空。 */
+/* 类型对象 → ID（复用类型缓存 + 形态归一，与 unit_types 同口径）。 */
 static int id_of_type(DWORD type, char *id, int idn)
 {
+    const struct TTypeCacheEnt *tc;
     id[0] = 0;
-    if (!type) return 0;
-    rd_str(type + T_ID, id, idn);
-    if (!id[0]) return 0;
+    if (!type || idn <= 0) return 0;
+    tc = ttype_cache_get(type);
+    if (!tc || !tc->id[0]) return 0;
+    lstrcpynA(id, tc->id, idn);
     morph_normalize(id, idn);
     return 1;
 }
@@ -1300,16 +1903,20 @@ static const struct { int slot_off; const char *key; } g_chan_defs[CH_COUNT] = {
    active=1 但 now.id 为空 = 该通道有厂但没在产，渲染端画"空闲"。 */
 static void read_one_factory(DWORD fp, struct QueueRec *qr)
 {
+    unsigned char fblk[0x50]; /* [0x24..0x74): PROGRESS(0x24), QUEUE_ITEMS(0x44), QUEUE_COUNT(0x50), OBJECT(0x58), IS_SUSPENDED(0x70) */
     DWORD obj = 0, qitems = 0;
     int progress = 0, qcount = 0, k;
     BYTE suspended = 0;
     char id[32];
 
     qr->active = 1;
-
-    rd_i32(fp + F_PROGRESS, &progress);
-    rd_u8 (fp + F_IS_SUSPENDED, &suspended);
-    if (!rd_u32(fp + F_OBJECT, &obj) || !obj) return;
+    if (!rd(fp + F_PROGRESS, fblk, sizeof(fblk))) return;
+    memcpy(&progress, fblk + (F_PROGRESS - F_PROGRESS), sizeof(progress));
+    memcpy(&qitems, fblk + (F_QUEUE_ITEMS - F_PROGRESS), sizeof(qitems));
+    memcpy(&qcount, fblk + (F_QUEUE_COUNT - F_PROGRESS), sizeof(qcount));
+    memcpy(&obj, fblk + (F_OBJECT - F_PROGRESS), sizeof(obj));
+    suspended = fblk[F_IS_SUSPENDED - F_PROGRESS];
+    if (!obj) return;
 
     {
         DWORD type = type_of_object(obj);
@@ -1322,32 +1929,32 @@ static void read_one_factory(DWORD fp, struct QueueRec *qr)
     }
 
     /* 排队项：QueuedObjects 里就是 TechnoTypeClass* */
-    if (rd_u32(fp + F_QUEUE_ITEMS, &qitems) && qitems &&
-        rd_i32(fp + F_QUEUE_COUNT, &qcount) && qcount > 0 && qcount <= 256) {
-        for (k = 0; k < qcount && qr->nnext < (int)(sizeof(qr->next) / sizeof(qr->next[0])); ++k) {
-            DWORD tp = 0;
-            if (!rd_u32(qitems + k * 4, &tp) || !tp) continue;
-            if (!id_of_type(tp, id, sizeof(id))) continue;
-            strncpy(qr->next[qr->nnext].id, id, sizeof(qr->next[qr->nnext].id) - 1);
-            qr->next[qr->nnext].pct = 0;
-            qr->nnext++;
+    if (qitems && qcount > 0 && qcount <= 256) {
+        DWORD qptrs[16];
+        int cap = (int)(sizeof(qr->next) / sizeof(qr->next[0]));
+        int want = (qcount < cap) ? qcount : cap;
+        if (rd(qitems, qptrs, (size_t)want * sizeof(DWORD))) {
+            for (k = 0; k < want && qr->nnext < cap; ++k) {
+                DWORD tp = qptrs[k];
+                if (!tp) continue;
+                if (!id_of_type(tp, id, sizeof(id))) continue;
+                strncpy(qr->next[qr->nnext].id, id, sizeof(qr->next[qr->nnext].id) - 1);
+                qr->next[qr->nnext].pct = 0;
+                qr->nnext++;
+            }
         }
     }
 }
 
-/* 生产队列采集。主路径是直接读 house 的 6 个主工厂槽——
-   这条路径不依赖 FactoryClass::Array 是否注册、也不依赖 Owner 反查，
-   只要 GetPrimaryFactory 的槽位语义没变就能出数据。
-   全局工厂数组只作为补充：槽位为空时（部分 AI/并行工厂不填槽）再从数组里找。 */
+/* 生产队列采集：直接读 house 的 6 个主工厂槽（不依赖全局工厂数组冗余反查）。 */
 static void collect_queues(DWORD *houses, DWORD nhouses, struct Snap *s)
 {
-    DWORD items = 0, count = 0, i, hi;
+    DWORD hi;
     int ch;
 
     for (hi = 0; hi < nhouses && hi < MAX_HOUSES; ++hi)
         memset(&s->players[hi].queues, 0, sizeof(s->players[hi].queues));
 
-    /* ---- 主路径：house 主工厂槽 ---- */
     for (hi = 0; hi < nhouses && hi < MAX_HOUSES; ++hi) {
         DWORD hp = houses[hi];
         struct PlayerRec *pr;
@@ -1358,31 +1965,6 @@ static void collect_queues(DWORD *houses, DWORD nhouses, struct Snap *s)
             DWORD slot = 0;
             if (!rd_u32(hp + g_chan_defs[ch].slot_off, &slot) || !slot) continue;
             read_one_factory(slot, &pr->queues[ch]);
-        }
-    }
-
-    /* ---- 补充路径：全局工厂数组里挂到主槽的工厂 ----
-       只处理槽位还没填上的通道，避免覆盖主路径的结果。 */
-    if (!rd_u32(A_FACTORY_ITEMS, &items) || !items) return;
-    if (!rd_u32(A_FACTORY_COUNT, &count) || count == 0 || count > 4096) return;
-
-    for (i = 0; i < count; ++i) {
-        DWORD fp = 0, owner = 0;
-        struct PlayerRec *pr = NULL;
-
-        if (!rd_u32(items + i * 4, &fp) || !fp) continue;
-        if (!rd_u32(fp + F_OWNER, &owner) || !owner) continue;
-
-        for (hi = 0; hi < nhouses && hi < MAX_HOUSES; ++hi)
-            if (houses[hi] == owner) { pr = &s->players[hi]; break; }
-        if (!pr || !pr->ptr) continue;
-
-        for (ch = 0; ch < CH_COUNT; ++ch) {
-            DWORD slot = 0;
-            if (!rd_u32(owner + g_chan_defs[ch].slot_off, &slot)) continue;
-            if (slot != fp) continue;
-            if (!pr->queues[ch].active) read_one_factory(fp, &pr->queues[ch]);
-            break;
         }
     }
 }
@@ -1446,9 +2028,9 @@ static int diag_queues(int seconds)
             hp = houses[hi];
             if (!hp) { printf("  house[%-2d] = NULL\n", hi); continue; }
             nm[0] = 0; faction[0] = 0;
-            rd_str(hp + H_PLAIN_NAME, nm, sizeof(nm));
+            rd_ansi_utf8(hp + H_PLAIN_NAME, 21, nm, sizeof(nm));
             rd_u32(hp + H_TYPE, &type);
-            if (type) rd_str(type + T_ID, faction, sizeof(faction));
+            if (type) rd_ansi_utf8(type + T_ID, 24, faction, sizeof(faction));
             printf("  house[%-2d] 0x%08lX  name=%-16s faction=%-8s  slots:",
                    hi, (unsigned long)hp, nm[0] ? nm : "?", faction[0] ? faction : "?");
             {
@@ -1608,6 +2190,7 @@ static void collect(struct Snap *s, int max_supers_per_player)
 
     rd_u32(A_CURRENT_FRAME, &frame);
     s->frame = frame;
+    sync_proc_caches(frame);
     rd_u32(A_CURRENT_PLAYER, &cur);
     rd_u32(A_OBSERVER, &obs);
 
@@ -1620,9 +2203,9 @@ static void collect(struct Snap *s, int max_supers_per_player)
         rd_u8(A_SESSION + SE_OUT_OF_SYNC, &oos);
         s->out_of_sync = oos;
     }
-    rd_str(A_SESSION + SE_SCENARIO_FILENAME, s->session_file, sizeof(s->session_file));
+    rd_ansi_utf8(A_SESSION + SE_SCENARIO_FILENAME, 514, s->session_file, sizeof(s->session_file));
 
-    /* scenario */
+    /* scenario（YRpp 精确源长度：Name=wchar_t[45]、UIName=char[32]、FileName=char[260]） */
     if (rd_u32(A_SCENARIO, &scen) && scen) {
         int start = -1, left = 0, now_ticks = (int)(timeGetTime() >> 4);
         int ticks;
@@ -1630,14 +2213,22 @@ static void collect(struct Snap *s, int max_supers_per_player)
         rd_i32(scen + SC_ELAPSED_TIMER + 0, &start);
         rd_i32(scen + SC_ELAPSED_TIMER + 8, &left);
         rd_u8 (scen + SC_IS_PAUSED, &paused);
-        rd_wstr(scen + SC_NAME, s->map_name, sizeof(s->map_name));
-        rd_str(scen + SC_UINAME, s->map_uiname, sizeof(s->map_uiname));
-        rd_str(scen + SC_FILENAME, s->map_file, sizeof(s->map_file));
+        rd_wstr_utf8(scen + SC_NAME, 45, s->map_name, sizeof(s->map_name));
+        rd_ansi_utf8(scen + SC_UINAME, 32, s->map_uiname, sizeof(s->map_uiname));
+        rd_ansi_utf8(scen + SC_FILENAME, 260, s->map_file, sizeof(s->map_file));
         ticks = (start == -1) ? left : left + (now_ticks - start);
         if (ticks < 0) ticks = 0;
         s->elapsed_sec = ticks * 16 / 1000;
         s->paused = (start == -1) ? 1 : 0;
         if (!s->paused && paused) s->paused = 1;
+    }
+
+    /* 按进程/对局缓存 spawn.ini（StolenTech + UIMapName）；
+       仅当内存 map_name/map_uiname 均为空且为 spawner 的 spawnmap.ini 时，用 UIMapName 兜底显示真实地图名。 */
+    refresh_spawn_ini_cache(frame);
+    if (!s->map_name[0] && !s->map_uiname[0] && g_spawn_ui_map_name[0] &&
+        (!_stricmp(s->map_file, "spawnmap.ini") || !_stricmp(s->session_file, "spawnmap.ini"))) {
+        utf8_copy_trunc(s->map_name, sizeof(s->map_name), g_spawn_ui_map_name);
     }
 
     /* v7.0/R22：Esc/选项菜单。两条独立信号，任一成立即视为菜单开着。
@@ -1666,8 +2257,8 @@ static void collect(struct Snap *s, int max_supers_per_player)
         rd_u8(A_GAMEMODE_OPTIONS + GO_SHORTGAME, &b); s->shortgame = b;
         rd_u8(A_GAMEMODE_OPTIONS + GO_ALLIES, &b);    s->allies = b;
     }
-    /* v6.7：StealTech 是否开着。非内存字段，读 spawn.ini。 */
-    s->stolen_tech_enabled = read_stolentech_option();
+    /* v6.7：StolenTech 是否开着（从按进程缓存的 spawn.ini 读取，不再每帧读盘）。 */
+    s->stolen_tech_enabled = g_spawn_stolen_tech;
 
     /* 观战标志 */
     {
@@ -1750,136 +2341,134 @@ static void collect(struct Snap *s, int max_supers_per_player)
             s->radar_scale_x1000 = (int)(rscale * 1000.0f + 0.5f);
     }
 
-    /* 玩家名单 */
-    for (i = 0; i < count; ++i) {
-        houses[i] = 0;
-        rd_u32(items + i * 4, &houses[i]);
-    }
-    compute_centers(houses, count);    nsupers = collect_supers(frame, allsupers, 2048);
-
-    for (i = 0; i < count; ++i) {
-        struct PlayerRec *p = &s->players[i];
-        DWORD hp = houses[i], type = 0;
-        int idx = 0, side = 0, aidiff = 0, team = 0, ip = 0;
-        int bal = 0, spent = 0, harvest = 0, stolen = 0, storage = 0;
-        int pout = 0, pdrain = 0, psurplus = 0;
-        int infc = 0, vehc = 0, airc = 0, wholast = -1;
-        int kuh[20], kbh[20];
-        int k;
-        char tmp[256], u8[256];
-
-        if (!hp) { p->ptr = 0; continue; }
-        p->ptr = hp;
-
-        rd_i32(hp + H_INDEX, &idx); p->index = idx;
-        rd_i32(hp + H_SIDE_INDEX, &side); p->side = side;
-        rd_i32(hp + H_AI_DIFFICULTY, &aidiff); p->ai_diff = aidiff;
-        rd_u32(hp + H_TYPE, &type);
-        if (type) {
-            rd_str(type + T_ID, tmp, sizeof(tmp));
-            to_utf8_ansi(tmp, p->faction, sizeof(p->faction));
-            rd_str(type + T_PARENT_COUNTRY, tmp, sizeof(tmp));
-            to_utf8_ansi(tmp, p->country, sizeof(p->country));
-        }
-        rd_str(hp + H_PLAIN_NAME, tmp, sizeof(tmp));
-        to_utf8_ansi(tmp, p->name, sizeof(p->name));
-        rd_wstr(hp + H_UINAME, p->uiname, sizeof(p->uiname));   /* UTF-16 -> UTF-8 */
-        /* v6/D1：PlainName 可能是引擎占位符 "<human player>"，此时取 UIName 真实昵称 */
-        if ((!p->name[0] || !strcmp(p->name, "<human player>")) && p->uiname[0])
-            strcpy(p->name, p->uiname);
-
-        rd(hp + H_COLOR, p->rgb, 3);
-        rd_u32(hp + H_ALLIES, &p->allies);
-        rd_i32(hp + H_TEAM_ID, &team); p->team = team;
-        rd_i32(hp + H_IP, &ip); (void)ip;
-
-        rd_u8(hp + H_IS_HUMAN, (BYTE *)&p->human);
-        rd_u8(hp + H_IS_IN_CTRL, (BYTE *)&p->in_ctrl);
-        rd_u8(hp + H_DEFEATED, (BYTE *)&p->defeated);
-        rd_u8(hp + H_IS_GAMEOVER, (BYTE *)&p->gameover);
-        rd_u8(hp + H_IS_WINNER, (BYTE *)&p->win);
-        rd_u8(hp + H_IS_LOSER, (BYTE *)&p->lose);
-        rd_u8(hp + H_IS_RESIGNER, (BYTE *)&p->resigned);
-        rd_u8(hp + H_IS_GIVERUPPER, (BYTE *)&p->gaveup);
-        rd_u8(hp + H_LOST_CONNECTION, (BYTE *)&p->lostconn);
-        rd_u8(hp + H_HAS_BEEN_SPIED, (BYTE *)&p->spied);
-        rd_u8(hp + H_HAS_BEEN_THIEVED, (BYTE *)&p->thieved);
-        rd_u8(hp + H_SIDE0_TECH_INFILTRATED, (BYTE *)&p->inf_side0);
-        rd_u8(hp + H_SIDE1_TECH_INFILTRATED, (BYTE *)&p->inf_side1);
-        rd_u8(hp + H_SIDE2_TECH_INFILTRATED, (BYTE *)&p->inf_side2);
-        rd_u8(hp + H_BARRACKS_INFILTRATED, (BYTE *)&p->inf_barracks);
-        rd_u8(hp + H_WAR_FACTORY_INFILTRATED, (BYTE *)&p->inf_warfactory);
-
-        /* v6.7：Ares 偷科技账本。原版那 5 个 bool 位（side0/1/2 + 兵营/重工）
-           只说明「渗透过哪个阵营」，不说明「拿到哪几个建筑」——
-           而 MO 的产物门槛是 Prerequisite.StolenTechs=1,11 这种索引对（AND），
-           必须读 Ares 的 32 位账本才能判断半套/整套。 */
-        p->stolen_tech_ok = read_stolen_tech(hp, &p->stolen_tech);
-        if (!p->stolen_tech_ok) p->stolen_tech = 0;
-
-        rd_i32(hp + H_BALANCE, &bal);           p->cash = bal;
-        rd_i32(hp + H_CREDITS_SPENT, &spent);   p->spent = spent;
-        rd_i32(hp + H_HARVESTED, &harvest);     p->harvested = harvest;
-        rd_i32(hp + H_STOLEN_CREDITS, &stolen); p->stolen = stolen;
-        rd_i32(hp + H_TOTAL_STORAGE, &storage); p->storage = storage;
-        rd_i32(hp + H_POWER_OUT, &pout);
-        rd_i32(hp + H_POWER_DRAIN, &pdrain);
-        rd_i32(hp + H_POWER_SURPLUS, &psurplus);
-        p->power_out = pout; p->power_drain = pdrain; p->power_surplus = psurplus;
-        rd_i32(hp + H_TOTAL_INF_COST, &infc);
-        rd_i32(hp + H_TOTAL_VEH_COST, &vehc);
-        rd_i32(hp + H_TOTAL_AIR_COST, &airc);
-        p->army_inf = infc; p->army_veh = vehc; p->army_air = airc;
-
-        rd_i32(hp + H_OWNED_UNITS, &p->owned_units);
-        rd_i32(hp + H_OWNED_NAVY, &p->owned_navy);
-        rd_i32(hp + H_OWNED_BUILDINGS, &p->owned_buildings);
-        rd_i32(hp + H_OWNED_INFANTRY, &p->owned_infantry);
-        rd_i32(hp + H_OWNED_AIRCRAFT, &p->owned_aircraft);
-
-        memset(kuh, 0, sizeof(kuh));
-        memset(kbh, 0, sizeof(kbh));
-        rd(hp + H_KILLS_OF_HOUSES, kuh, sizeof(kuh));
-        rd(hp + H_KILLS_BLD_OF_HOUSES, kbh, sizeof(kbh));
-        p->kills_units = 0; p->kills_buildings = 0;
-        for (k = 0; k < 20; ++k) {
-            if (kuh[k] > 0) p->kills_units += kuh[k];
-            if (kbh[k] > 0) p->kills_buildings += kbh[k];
-        }
-        rd_i32(hp + H_LOST_UNITS, &p->lost_units);
-        rd_i32(hp + H_LOST_BUILDINGS, &p->lost_buildings);
-        rd_i32(hp + H_POINT_TOTAL, &p->points);
-        rd_i32(hp + H_WHO_LAST_HURT_ME, &wholast); p->last_hurt = wholast;
-
-        rd_i32(hp + H_BASE + B_PERCENT_BUILT, &p->base_pct);
-        rd_i16(hp + H_BASE + B_CENTER + 0, &p->base_cx);
-        rd_i16(hp + H_BASE + B_CENTER + 2, &p->base_cy);
-        p->has_centroid = house_center(hp, &p->cent_x, &p->cent_y, &p->cent_bld);
-
-        /* 出生点 */
-        p->spawn_pos = -1;
+    /* 玩家名单 + 一次性读 SC_HOUSE_INDICES（32 字节）避免每房重复 RPM */
+    {
+        int spawn_indices[8];
+        int has_spawn_indices = 0;
+        memset(houses, 0, count * sizeof(DWORD));
+        rd(items, houses, count * sizeof(DWORD));
         if (scen) {
-            int hi = 0;
-            for (k = 0; k < 8; ++k) {
-                if (!rd_i32(scen + SC_HOUSE_INDICES + k * 4, &hi)) break;
-                if (hi == idx) { p->spawn_pos = k; break; }
+            has_spawn_indices = rd(scen + SC_HOUSE_INDICES, spawn_indices, sizeof(spawn_indices));
+        }
+        compute_centers(houses, count);
+        nsupers = collect_supers(frame, allsupers, 2048);
+
+        for (i = 0; i < count; ++i) {
+            struct PlayerRec *p = &s->players[i];
+            DWORD hp = houses[i], type = 0;
+            int idx = 0, side = 0, aidiff = 0, team = 0;
+            int bal = 0, spent = 0, harvest = 0, stolen = 0, storage = 0;
+            int pout = 0, pdrain = 0, psurplus = 0;
+            int infc = 0, vehc = 0, airc = 0, wholast = -1;
+            int kuh[20], kbh[20];
+            int k;
+
+            if (!hp) { p->ptr = 0; continue; }
+            p->ptr = hp;
+
+            rd_i32(hp + H_INDEX, &idx); p->index = idx;
+            rd_i32(hp + H_SIDE_INDEX, &side); p->side = side;
+            rd_i32(hp + H_AI_DIFFICULTY, &aidiff); p->ai_diff = aidiff;
+            rd_u32(hp + H_TYPE, &type);
+            if (type) {
+                rd_ansi_utf8(type + T_ID, 24, p->faction, sizeof(p->faction));
+                rd_ansi_utf8(type + T_PARENT_COUNTRY, 25, p->country, sizeof(p->country));
+            }
+            rd_ansi_utf8(hp + H_PLAIN_NAME, 21, p->name, sizeof(p->name));
+            rd_wstr_utf8(hp + H_UINAME, 21, p->uiname, sizeof(p->uiname));   /* UTF-16 -> UTF-8 */
+            /* v6/D1：PlainName 可能是引擎占位符 "<human player>"，此时取 UIName 真实昵称 */
+            if ((!p->name[0] || !strcmp(p->name, "<human player>")) && p->uiname[0])
+                utf8_copy_trunc(p->name, sizeof(p->name), p->uiname);
+
+            rd(hp + H_COLOR, p->rgb, 3);
+            rd_u32(hp + H_ALLIES, &p->allies);
+            rd_i32(hp + H_TEAM_ID, &team); p->team = team;
+
+            rd_u8(hp + H_IS_HUMAN, (BYTE *)&p->human);
+            rd_u8(hp + H_IS_IN_CTRL, (BYTE *)&p->in_ctrl);
+            rd_u8(hp + H_DEFEATED, (BYTE *)&p->defeated);
+            rd_u8(hp + H_IS_GAMEOVER, (BYTE *)&p->gameover);
+            rd_u8(hp + H_IS_WINNER, (BYTE *)&p->win);
+            rd_u8(hp + H_IS_LOSER, (BYTE *)&p->lose);
+            rd_u8(hp + H_IS_RESIGNER, (BYTE *)&p->resigned);
+            rd_u8(hp + H_IS_GIVERUPPER, (BYTE *)&p->gaveup);
+            rd_u8(hp + H_LOST_CONNECTION, (BYTE *)&p->lostconn);
+            rd_u8(hp + H_HAS_BEEN_SPIED, (BYTE *)&p->spied);
+            rd_u8(hp + H_HAS_BEEN_THIEVED, (BYTE *)&p->thieved);
+            rd_u8(hp + H_SIDE0_TECH_INFILTRATED, (BYTE *)&p->inf_side0);
+            rd_u8(hp + H_SIDE1_TECH_INFILTRATED, (BYTE *)&p->inf_side1);
+            rd_u8(hp + H_SIDE2_TECH_INFILTRATED, (BYTE *)&p->inf_side2);
+            rd_u8(hp + H_BARRACKS_INFILTRATED, (BYTE *)&p->inf_barracks);
+            rd_u8(hp + H_WAR_FACTORY_INFILTRATED, (BYTE *)&p->inf_warfactory);
+
+            /* v6.7：Ares 偷科技账本。原版那 5 个 bool 位（side0/1/2 + 兵营/重工）
+               只说明「渗透过哪个阵营」，不说明「拿到哪几个建筑」——
+               而 MO 的产物门槛是 Prerequisite.StolenTechs=1,11 这种索引对（AND），
+               必须读 Ares 的 32 位账本才能判断半套/整套。 */
+            p->stolen_tech_ok = read_stolen_tech(hp, &p->stolen_tech);
+            if (!p->stolen_tech_ok) p->stolen_tech = 0;
+
+            rd_i32(hp + H_BALANCE, &bal);           p->cash = bal;
+            rd_i32(hp + H_CREDITS_SPENT, &spent);   p->spent = spent;
+            rd_i32(hp + H_HARVESTED, &harvest);     p->harvested = harvest;
+            rd_i32(hp + H_STOLEN_CREDITS, &stolen); p->stolen = stolen;
+            rd_i32(hp + H_TOTAL_STORAGE, &storage); p->storage = storage;
+            rd_i32(hp + H_POWER_OUT, &pout);
+            rd_i32(hp + H_POWER_DRAIN, &pdrain);
+            rd_i32(hp + H_POWER_SURPLUS, &psurplus);
+            p->power_out = pout; p->power_drain = pdrain; p->power_surplus = psurplus;
+            rd_i32(hp + H_TOTAL_INF_COST, &infc);
+            rd_i32(hp + H_TOTAL_VEH_COST, &vehc);
+            rd_i32(hp + H_TOTAL_AIR_COST, &airc);
+            p->army_inf = infc; p->army_veh = vehc; p->army_air = airc;
+
+            rd_i32(hp + H_OWNED_UNITS, &p->owned_units);
+            rd_i32(hp + H_OWNED_NAVY, &p->owned_navy);
+            rd_i32(hp + H_OWNED_BUILDINGS, &p->owned_buildings);
+            rd_i32(hp + H_OWNED_INFANTRY, &p->owned_infantry);
+            rd_i32(hp + H_OWNED_AIRCRAFT, &p->owned_aircraft);
+
+            memset(kuh, 0, sizeof(kuh));
+            memset(kbh, 0, sizeof(kbh));
+            rd(hp + H_KILLS_OF_HOUSES, kuh, sizeof(kuh));
+            rd(hp + H_KILLS_BLD_OF_HOUSES, kbh, sizeof(kbh));
+            p->kills_units = 0; p->kills_buildings = 0;
+            for (k = 0; k < 20; ++k) {
+                if (kuh[k] > 0) p->kills_units += kuh[k];
+                if (kbh[k] > 0) p->kills_buildings += kbh[k];
+            }
+            rd_i32(hp + H_LOST_UNITS, &p->lost_units);
+            rd_i32(hp + H_LOST_BUILDINGS, &p->lost_buildings);
+            rd_i32(hp + H_POINT_TOTAL, &p->points);
+            rd_i32(hp + H_WHO_LAST_HURT_ME, &wholast); p->last_hurt = wholast;
+
+            rd_i32(hp + H_BASE + B_PERCENT_BUILT, &p->base_pct);
+            rd_i16(hp + H_BASE + B_CENTER + 0, &p->base_cx);
+            rd_i16(hp + H_BASE + B_CENTER + 2, &p->base_cy);
+            p->has_centroid = house_center(hp, &p->cent_x, &p->cent_y, &p->cent_bld);
+
+            /* 出生点（使用循环外预读的 spawn_indices） */
+            p->spawn_pos = -1;
+            if (has_spawn_indices) {
+                for (k = 0; k < 8; ++k) {
+                    if (spawn_indices[k] == idx) { p->spawn_pos = k; break; }
+                }
+            }
+
+            /* v6/D1：观察者房判定（放在 spawn_pos 之后，用其做兜底判据） */
+            p->is_observer_house = 0;
+            if (obs && hp == obs) p->is_observer_house = 1;
+            else if (cur && hp == cur && s->is_observer) p->is_observer_house = 1;
+            /* v6.1：共享模式下 is_observer=0，不能拿 spawn=-1 判观察者房 */
+            else if (s->is_observer && p->spawn_pos == -1 && p->human) p->is_observer_house = 1;
+
+            /* 该玩家的超武 */
+            p->nsupers = 0;
+            for (k = 0; k < nsupers && p->nsupers < max_supers_per_player && p->nsupers < MAX_SUPERS; ++k) {
+                if (allsupers[k].owner != hp) continue;
+                p->supers[p->nsupers++] = allsupers[k];
             }
         }
-
-        /* v6/D1：观察者房判定（放在 spawn_pos 之后，用其做兜底判据） */
-        p->is_observer_house = 0;
-        if (obs && hp == obs) p->is_observer_house = 1;
-        else if (cur && hp == cur && s->is_observer) p->is_observer_house = 1;
-        /* v6.1：共享模式下 is_observer=0，不能拿 spawn=-1 判观察者房 */
-        else if (s->is_observer && p->spawn_pos == -1 && p->human) p->is_observer_house = 1;
-
-        /* 该玩家的超武 */
-        p->nsupers = 0;
-        for (k = 0; k < nsupers && p->nsupers < max_supers_per_player && p->nsupers < MAX_SUPERS; ++k) {
-            if (allsupers[k].owner != hp) continue;
-            p->supers[p->nsupers++] = allsupers[k];
-        }
-        (void)u8;
     }
     s->nhouses = (int)count;
 
@@ -1893,7 +2482,8 @@ static void collect(struct Snap *s, int max_supers_per_player)
     /* 生产队列（v6.6）：按主工厂槽归属到 6 条通道 */
     collect_queues(houses, count, s);
 
-    /* NodeNames（真实昵称，宽字符） */
+    /* NodeNames（真实昵称，宽字符；YRpp NodeNameType 为 pack(1)，Name 精确 20 个 wchar_t = 40 B，
+       紧邻 +0x28 sockaddr_in Address，严禁多读到 Address/Serial 造成越界与乱码） */
     {
         DWORD nitems = 0, ncount = 0;
         if (rd_u32(A_NODENAME_ARRAY + V_ITEMS, &nitems) && nitems &&
@@ -1902,12 +2492,11 @@ static void collect(struct Snap *s, int max_supers_per_player)
             s->nnode = (int)ncount;
             for (k = 0; k < ncount; ++k) {
                 DWORD np = 0;
-                wchar_t wname[32];
-                char tmp[128];
+                wchar_t wname[21];
                 if (!rd_u32(nitems + k * 4, &np) || !np) continue;
-                if (!rd(np + 0x00, wname, sizeof(wname))) continue;
-                to_utf8_wide(wname, tmp, sizeof(tmp));
-                strncpy(s->node_names[k], tmp, sizeof(s->node_names[k]) - 1);
+                if (!rd(np + 0x00, wname, 20 * sizeof(wchar_t))) continue;
+                wname[20] = 0;
+                to_utf8_wide_n(wname, 20, s->node_names[k], sizeof(s->node_names[k]));
             }
         }
     }
@@ -1922,22 +2511,33 @@ static void collect(struct Snap *s, int max_supers_per_player)
    一旦忘记中途拷贝，整局样本就全没了（2026-10-21 实测踩到）。
    --record 打开后每帧追加一行，退出后文件仍在。 */
 static FILE *g_rec = NULL;
+static SB    g_rec_sb = { NULL, 0, 0 };
 
 static void record_line(const struct Snap *s, DWORD pid, const char *json, size_t len)
 {
-    size_t i;
+    size_t i = 0;
     (void)pid;
     if (!g_rec || !json) return;
     /* 守护模式下桥整天常驻：大厅/未开局的帧没有留档价值，
        只记 ok=true 的局内帧，否则 JSONL 会被每秒一行撑爆。 */
     if (!s->ok) return;
-    fprintf(g_rec, "{\"tick\": %lu, \"state\": ", (unsigned long)GetTickCount());
-    for (i = 0; i < len; ++i) {
-        char c = json[i];
-        fputc((c == '\n' || c == '\r') ? ' ' : c, g_rec);
+    if (!g_rec_sb.p) sb_init(&g_rec_sb);
+    g_rec_sb.n = 0;
+    sb_printf(&g_rec_sb, "{\"tick\": %lu, \"state\": ", (unsigned long)GetTickCount());
+    while (i < len) {
+        size_t start = i;
+        while (i < len && json[i] != '\n' && json[i] != '\r') ++i;
+        if (i > start) sb_add_n(&g_rec_sb, json + start, i - start);
+        while (i < len && (json[i] == '\n' || json[i] == '\r')) {
+            sb_add_n(&g_rec_sb, " ", 1);
+            ++i;
+        }
     }
-    fputs("}\n", g_rec);
-    fflush(g_rec);
+    sb_add_n(&g_rec_sb, "}\n", 2);
+    if (g_rec_sb.p && g_rec_sb.n > 0) {
+        fwrite(g_rec_sb.p, 1, g_rec_sb.n, g_rec);
+        fflush(g_rec);
+    }
 }
 
 static void emit_json(SB *b, const struct Snap *s, DWORD pid)
@@ -2183,7 +2783,8 @@ static void make_dir_of(const char *path)
 }
 
 static int dry_run(const char *out, const char *text)
-{    struct Snap s;
+{
+    static struct Snap s;
     SB jb, tb;
     memset(&s, 0, sizeof(s));
     s.ok = 1; s.frame = 12345; s.elapsed_sec = 197; s.game_mode = 3;
@@ -2407,27 +3008,7 @@ int main(int argc, char **argv)
         }
     }
 
-    /* v6.6：单实例。两个桥同时 MoveFileEx 同一个 JSON 会互相踩，
-       而守护模式下迟早会有人双击两次。 */
-    {
-        HANDLE once = CreateMutexA(NULL, TRUE, "MO_HUD_BRIDGE_SINGLETON");
-        if (once && GetLastError() == ERROR_ALREADY_EXISTS) {
-            printf("another hud_bridge is already running; exiting.\n");
-            CloseHandle(once);
-            return 3;
-        }
-        /* once 故意不释放：进程退出时系统回收，生命周期恰好等于本进程 */
-    }
-
-    if (record[0]) {
-        make_dir_of(record);
-        g_rec = fopen(record, "ab");   /* 追加：同一天多局累积，不会互相覆盖 */
-        if (!g_rec) printf("warning: cannot open record file %s\n", record);
-        else printf("record -> %s (append)\n", record);
-    }
-
-    /* --dump-screen：与守护模式分开。有 pid 就立刻 dump 并退出（旧行为），
-       没 pid 则短轮询等游戏起来（最多 ~30 秒），方便"先跑工具再开局"。 */
+    /* --dump-screen：一次性诊断，放在单实例互斥体检查之前，可与守护桥并存 */
     if (dump_screen) {
         int waited = 0;
         if (!pid) {
@@ -2446,8 +3027,6 @@ int main(int argc, char **argv)
             return 2;
         }
         {
-            /* Snap 约 665 KB（64 个 PlayerRec × 10.4 KB）。放栈上会超默认 1 MB 栈，
-               尤其 main 里有两处实例时必崩（实测 0xC00000FD）。 */
             static struct Snap s;
             collect(&s, max_supers);
             printf("screen.valid = %s\n", s.screen_valid ? "true" : "false");
@@ -2475,7 +3054,6 @@ int main(int argc, char **argv)
             printf("  cross-check2 : view.h+32=%d surface.h=%d   sidebar.y+h=%d\n",
                    s.view_rect[3] + 32, s.screen_h,
                    s.sidebar_rect[1] + s.sidebar_rect[3]);
-            /* 队列摘要：通道 → 在产 ID / 进度 / 后续条数 */
             {
                 int qi, pi;
                 for (pi = 0; pi < s.nhouses; ++pi) {
@@ -2493,47 +3071,84 @@ int main(int argc, char **argv)
             }
             {
                 SB jb, tb;
-                sb_init(&jb); sb_init(&tb);
+                sb_init(&jb);
                 emit_json(&jb, &s, pid);
-                emit_text(&tb, &s);
                 write_atomic(out, jb.p, jb.n);
-                if (do_text) write_atomic(text, tb.p, tb.n);
+                if (do_text) {
+                    sb_init(&tb);
+                    emit_text(&tb, &s);
+                    write_atomic(text, tb.p, tb.n);
+                    sb_free(&tb);
+                }
                 printf("(full state also written to %s)\n", out);
-                sb_free(&jb); sb_free(&tb);
+                sb_free(&jb);
             }
         }
         CloseHandle(g_proc);
-        if (g_rec) { fclose(g_rec); g_rec = NULL; }
+        g_proc = NULL;
         return 0;
     }
 
+    /* v6.6：单实例（含跨权限 ERROR_ACCESS_DENIED 防双开）。 */
+    {
+        HANDLE once = CreateMutexA(NULL, FALSE, "MO_HUD_BRIDGE_SINGLETON");
+        DWORD merr = GetLastError();
+        if ((!once && merr == ERROR_ACCESS_DENIED) || (once && merr == ERROR_ALREADY_EXISTS)) {
+            fprintf(stderr, "hud_bridge already running (err=%lu)\n", (unsigned long)merr);
+            if (once) CloseHandle(once);
+            return 2;
+        }
+        /* once 故意不释放：进程退出时系统回收，生命周期恰好等于本进程 */
+    }
+
+    SetConsoleCtrlHandler(on_ctrl_signal, TRUE);
+
+    if (record[0]) {
+        make_dir_of(record);
+        g_rec = fopen(record, "ab");   /* 追加：同一天多局累积，不会互相覆盖 */
+        if (!g_rec) printf("warning: cannot open record file %s\n", record);
+        else printf("record -> %s (append)\n", record);
+    }
+
     /* ---------------------------------------------------------------- 守护 */
-    /* v6.6：桥常驻。游戏进程生灭（一局结束→回大厅→下一局）不再导致桥退出，
-       也就不会再出现"第二局页面读到的永远是一份 ok:false 的静止文件"。
-       用 handle 判活而不是 pid：pid 会被系统复用，handle 不会。 */
     printf("bridge: daemon interval=%dms out=%s text=%s\n",
            interval, out, do_text ? text : "-");
 
     {
         int phase = -1;            /* -1 = 还没打印过 */
         int client_seen = 0;
+        DWORD last_client_check = 0;
         int reopen_warned = 0;
-        DWORD game_pid = pid;      /* --pid 指定的固定目标；0 = 自动发现 */
+        DWORD fixed_pid = pid;     /* --pid 指定的固定目标；0 = 自动发现 */
+        DWORD game_pid = pid;
+        SB jb = { NULL, 0, 0 }, tb = { NULL, 0, 0 };
 
-        for (;;) {
-            static struct Snap s;   /* 665 KB，必须静态（见上） */
-            SB jb, tb;
+        sb_init(&jb);
+        if (do_text) sb_init(&tb);
+
+        while (!g_stop) {
+            static struct Snap s;   /* ~756 KB，必须静态 */
             int have_game = 0;
+            DWORD found_game = 0, found_client = 0;
+            int scanned_client = 0;
 
             unit_count_poll();   /* 一帧内保持同一份规则，不在扫描单位时读配置。 */
             if (!g_proc) {
-                DWORD found = game_pid ? game_pid : find_gamemd();
-                if (found) {
-                    HANDLE h = OpenProcess(PROC_ACCESS, FALSE, found);
+                if (fixed_pid) {
+                    found_game = fixed_pid;
+                } else {
+                    scan_game_and_client(&found_game, &found_client);
+                    scanned_client = 1;
+                }
+                if (found_game) {
+                    HANDLE h = OpenProcess(PROC_ACCESS, FALSE, found_game);
                     if (h && preflight(h)) {
                         g_proc = h;
-                        game_pid = found;
+                        game_pid = found_game;
                         g_fail = 0;
+                        reopen_warned = 0;
+                        reset_proc_caches();
+                        reset_spawn_ini_cache();
                     } else {
                         if (h) { CloseHandle(h); }
                         else if (!reopen_warned) {
@@ -2542,7 +3157,6 @@ int main(int argc, char **argv)
                                    GetLastError());
                             reopen_warned = 1;
                         }
-                        /* preflight 失败：可能抢在原版 YR 上，退避重试 */
                     }
                 }
             }
@@ -2550,35 +3164,54 @@ int main(int argc, char **argv)
 
             if (have_game) {
                 if (!proc_alive(g_proc)) {
-                    /* 游戏退出：写一帧 post_match，然后进入等待重挂 */
+                    /* 游戏退出：写一帧 post_match 并保留可见窗口（>=1500ms），
+                       确保 Rust live.rs 与前端可靠捕获局终事件后再切 lobby/no_client。 */
                     memset(&s, 0, sizeof(s));
                     s.phase = PH_POST_MATCH;
                     s.client_running = find_client() ? 1 : 0;
-                    sb_init(&jb); sb_init(&tb);
+                    client_seen = s.client_running;
+                    last_client_check = GetTickCount();
+                    jb.n = 0;
                     emit_json(&jb, &s, game_pid);
-                    emit_text(&tb, &s);
                     write_atomic(out, jb.p, jb.n);
-                    if (do_text) write_atomic(text, tb.p, tb.n);
-                    sb_free(&jb); sb_free(&tb);
-                    /* JSONL 分隔行，事后切分多局样本靠它，不靠猜 ok 翻转 */
+                    if (do_text) {
+                        tb.n = 0;
+                        emit_text(&tb, &s);
+                        write_atomic(text, tb.p, tb.n);
+                    }
                     if (g_rec) {
                         fprintf(g_rec, "{\"tick\": %lu, \"event\": \"match_end\", \"pid\": %lu}\n",
                                 (unsigned long)GetTickCount(), (unsigned long)game_pid);
                         fflush(g_rec);
                     }
                     printf("game exited (pid=%lu); waiting for next match.\n", (unsigned long)game_pid);
+                    fflush(stdout);
                     CloseHandle(g_proc);
                     g_proc = NULL;
-                    game_pid = 0;
+                    game_pid = fixed_pid;
+                    phase = PH_POST_MATCH;
+                    reset_proc_caches();
+                    reset_spawn_ini_cache();
+                    sleep_interruptible(interval < 1500 ? 1500 : interval);
                     continue;
                 }
 
                 collect(&s, max_supers);
+                /* 低频回填 client_running（每 3 秒一次，避免高频快照） */
+                {
+                    DWORD now_t = GetTickCount();
+                    if (last_client_check == 0 || (now_t - last_client_check) >= 3000u) {
+                        client_seen = find_client() ? 1 : 0;
+                        last_client_check = now_t;
+                    }
+                    s.client_running = client_seen;
+                }
                 if (!s.ok && s.frame == 0) s.phase = PH_LOADING;
                 else s.phase = s.ok ? PH_MATCH : PH_LOADING;
             } else {
-                DWORD cpid = find_client();
+                DWORD cpid = scanned_client ? found_client : find_client();
                 client_seen = cpid ? 1 : 0;
+                last_client_check = GetTickCount();
                 memset(&s, 0, sizeof(s));
                 s.phase = cpid ? PH_LOBBY : PH_NO_CLIENT;
                 s.client_running = client_seen;
@@ -2591,21 +3224,29 @@ int main(int argc, char **argv)
                 phase = s.phase;
             }
 
-            sb_init(&jb); sb_init(&tb);
+            jb.n = 0;
             emit_json(&jb, &s, game_pid);
-            emit_text(&tb, &s);
             if (!write_atomic(out, jb.p, jb.n)) {
-                /* 读端未共享删除权限时 MoveFileEx 会失败；静默漏帧在直播里看不出来 */
                 static int wa_fail = 0;
                 if (++wa_fail == 1 || (wa_fail % 100) == 0)
                     printf("warning: write %s failed (%d times)\n", out, wa_fail);
             }
-            if (do_text && !write_atomic(text, tb.p, tb.n)) { /* 同上，文本源不关键 */ }
+            if (do_text) {
+                tb.n = 0;
+                emit_text(&tb, &s);
+                write_atomic(text, tb.p, tb.n);
+            }
             record_line(&s, game_pid, jb.p, jb.n);
-            sb_free(&jb); sb_free(&tb);
 
             /* 挂上了就按 interval 跑；没挂上放慢到 1s，别空转扫进程 */
-            Sleep(g_proc ? interval : 1000);
+            sleep_interruptible(g_proc ? interval : 1000);
         }
+
+        sb_free(&jb);
+        if (do_text) sb_free(&tb);
+        sb_free(&g_rec_sb);
+        if (g_proc) { CloseHandle(g_proc); g_proc = NULL; }
+        if (g_rec) { fclose(g_rec); g_rec = NULL; }
     }
+    return 0;
 }

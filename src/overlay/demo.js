@@ -494,13 +494,13 @@
 
   function powerBox(p) {
     var w = powerOf(p);
-    return '<span class="pbox' + (w.over ? ' over' : '') + '" title="电力：已用 / 上限">' +
-      '<span class="ico bolt">⚡</span>' + w.used + '/' + w.cap + '</span>';
+    return '<span class="pbox' + (w.over ? ' over' : '') + '" data-stat="power" title="电力：已用 / 上限">' +
+      '<span class="ico bolt">⚡</span><span class="pval">' + w.used + '/' + w.cap + '</span></span>';
   }
 
   function cashBox(p) {
-    return '<span class="pbox" title="资金">' +
-      '<span class="ico cash">●</span>' + fmtCash(p.cash) + '</span>';
+    return '<span class="pbox" data-stat="cash" title="资金">' +
+      '<span class="ico cash">●</span><span class="cval">' + fmtCash(p.cash) + '</span></span>';
   }
 
   function playerChip(p) {
@@ -528,21 +528,24 @@
     return t.content.firstElementChild;
   }
 
-  /* items: 数据数组；key(it): 稳定键；make(it): 新建节点；update(el, it):
+  /* items: 数据数组；key(it, idx): 稳定键；make(it): 新建节点；update(el, it):
      原位刷新，返回 false 表示放弃复用（该节点整体重建）。 */
   function patchChildren(parent, items, key, make, update) {
-    var keep = {};
+    var keep = Object.create(null);
     /* children 是活集合，先快照，遍历中的 insertBefore/remove 不能影响它。
-       无 key 的子节点视为 make() 的遗留物，直接清掉，
-       防止它和键控节点并存导致内容翻倍。 */
+       无 key 或重复 key 的子节点立即清掉，杜绝孤儿 DOM 泄漏。 */
     Array.prototype.slice.call(parent.children).forEach(function (n) {
-      if (n.dataset.key) keep[n.dataset.key] = n;
+      var dk = n.dataset.key;
+      if (dk && !keep[dk]) keep[dk] = n;
       else n.remove();
     });
 
+    var usedKeys = Object.create(null);
     var cursor = null;
-    items.forEach(function (it) {
-      var k = key(it);
+    items.forEach(function (it, idx) {
+      var k = String(key(it, idx));
+      if (usedKeys[k]) k = k + '#' + idx;
+      usedKeys[k] = true;
       var el = keep[k];
       delete keep[k];
       if (!el || (update && update(el, it) === false)) {
@@ -558,8 +561,10 @@
     Object.keys(keep).forEach(function (k) { keep[k].remove(); });
   }
 
-  function playerKey(p) {
-    return p.name + '|' + p.color;
+  function playerKey(p, idx) {
+    if (p && p.slot !== undefined && p.slot !== null) return 'slot:' + p.slot;
+    if (p && p._slot !== undefined && p._slot !== null) return 'slot:' + p._slot;
+    return 'idx:' + (idx || 0) + ':' + (p ? p.name : '');
   }
 
   function updatePlayerChip(el, p) {
@@ -567,12 +572,29 @@
     if ((flag ? flag.getAttribute('src') : '') !== flagOf(p)) return false;
     var title = p.factionCN || p.faction || '';
     if (p.human === false) title += ' · AI' + (p.aiDiff ? ' ' + p.aiDiff : '');
-    el.className = 'pchip' + (p.human === false ? ' ai' : '');
-    el.style.setProperty('--c', p.color);
-    el.title = p.name + (title ? ' · ' + title : '');
-    /* 国家未变时复用旗帜，只刷新电力/资金；国家变化交给 patchChildren 重建。 */
-    var stats = el.querySelector('.pstats');
-    if (stats) stats.innerHTML = powerBox(p) + cashBox(p);
+    var nextCls = 'pchip' + (p.human === false ? ' ai' : '');
+    if (el.className !== nextCls) el.className = nextCls;
+    if (el._lastColor !== p.color) {
+      el.style.setProperty('--c', p.color);
+      el._lastColor = p.color;
+    }
+    var nextTitle = p.name + (title ? ' · ' + title : '');
+    if (el.title !== nextTitle) el.title = nextTitle;
+    /* 国家未变时原位更新电力与资金文本节点，避免每帧 innerHTML 重建。 */
+    var pwrBox = el._pwrBox || (el._pwrBox = el.querySelector('[data-stat="power"]'));
+    var pwrVal = el._pwrVal || (el._pwrVal = pwrBox && pwrBox.querySelector('.pval'));
+    var cashVal = el._cashVal || (el._cashVal = el.querySelector('.cval'));
+    if (pwrBox && pwrVal && cashVal) {
+      var w = powerOf(p);
+      pwrBox.classList.toggle('over', !!w.over);
+      var pText = w.used + '/' + w.cap;
+      if (pwrVal.textContent !== pText) pwrVal.textContent = pText;
+      var cText = fmtCash(p.cash);
+      if (cashVal.textContent !== cText) cashVal.textContent = cText;
+    } else {
+      var stats = el.querySelector('.pstats');
+      if (stats) stats.innerHTML = powerBox(p) + cashBox(p);
+    }
   }
 
   function renderTopBar() {
@@ -717,16 +739,22 @@
     state.queueW = qW;
   }
 
+  var lastQueueGeomSig = '';
+
   /* 把几何写成 CSS 变量，样式表里不再出现 60/48/3 这些魔法数。
      写在 .queue-column 上即可被所有 .qpanel/.qitem 继承，
-     不需要逐个面板设置；以后加新面板也不用改这里。 */
+     加签名缓存避免每帧重写 16 个 CSS 变量。 */
   function queueGeomVars() {
     var col = $('#queueColumn');
     if (!col) return;
     var w = state.queueCellW || 60;
-    /* 字号按格子宽度等比缩：60px 时保持原来的 10/13/12/9，缩到 32px 时约 5~6px。
-       下限 6px —— 再小在直播压缩后也认不出，不如靠颜色/数量。
-       注意 badge 的 line-height 用整数像素，避免半像素高度导致边框糊。 */
+    var h = state.queueCellH || 48;
+    var gap = state.queueGap || 3;
+    var cols = state.queueCols || 3;
+    var qw = state.queueW || 168;
+    var sig = [w, h, gap, cols, qw].join(':');
+    if (sig === lastQueueGeomSig) return;
+    lastQueueGeomSig = sig;
     var k = w / 60;
     var fs = Math.max(6, Math.round(10 * k));
     var fsLh = Math.max(8, Math.round(13 * k));
@@ -735,9 +763,9 @@
     var badgeMin = Math.max(10, Math.round(14 * k));
     var vars = {
       '--qc-w': w + 'px',
-      '--qc-h': (state.queueCellH || 48) + 'px',
-      '--qc-gap': (state.queueGap || 3) + 'px',
-      '--qc-cols': String(state.queueCols || 3),
+      '--qc-h': h + 'px',
+      '--qc-gap': gap + 'px',
+      '--qc-cols': String(cols),
       '--qc-fs': fs + 'px',
       '--qc-fs-lh': fsLh + 'px',
       '--qc-idle-fs': idleFs + 'px',
@@ -745,12 +773,9 @@
       '--qc-uid-fs': uidFs + 'px',
       '--qc-badge-min': badgeMin + 'px'
     };
-    /* 渗透框几何（v6.7）：4 格铺满面板内可用宽，字号按「最长标签能否放下」反推。
-       不用系数估——「尤」把最长标签压到 2 字后，系数法会留下大片空白。
-       上界 12px：再大格高会顶穿 3v3 的纵向预算。 */
-    var stripAvail = Math.max(0, (state.queueW || 168) - Q_PAD_X - 4);
+    var stripAvail = Math.max(0, qw - Q_PAD_X - 4);
     var fcCellW = Math.floor((stripAvail - 3 * 3) / 4);
-    var fcTextW = fcCellW - 6;                 /* 内边距 1+1、左缘色条 2、边框 2 */
+    var fcTextW = fcCellW - 6;
     var fcFs = 7;
     for (var tfs = 12; tfs >= 7; tfs--) {
       if (textWidthPx('焚风', tfs) <= fcTextW) { fcFs = tfs; break; }
@@ -800,14 +825,15 @@
      开关没开时技能区配额为 0，单位区独占全部行数（与改造前一致）。 */
   var SW_SHARE = 0.5;      /* 技能区占卡片格区行数的固定份额 */
 
-  /* 这张卡片可用的格区高度（不含 head/padding/border） */
+  /* 这张卡片可用的格区高度（不含 head/padding/border）：
+     perCard 已扣除每张卡片的 CARD_HEAD_H + CARD_PAD_H，勿重复二次扣除。 */
   function cardGridBudget() {
     var rail = $('[data-rail="A"]');
     if (!rail) return 0;
     var n = Math.max(1, state.perTeam);
     var perCard = (rail.clientHeight - n * (CARD_HEAD_H + CARD_PAD_H)
                    - (n - 1) * CARD_GAP_H) / n;
-    return Math.max(ROW_H, perCard - CARD_HEAD_H - CARD_PAD_H);
+    return Math.max(ROW_H, perCard);
   }
 
   /* 算出两个互不重叠的行数配额：[单位行数, 技能行数]。
@@ -1413,24 +1439,23 @@
     queueGeomVars();
     if (!queueColumn) return;
 
-    if (!queueChk.checked) {
+    var wantQueue = queueChk.checked && (state.overlay || gameUiChk.checked);
+    var wasHidden = queueColumn.classList.contains('hidden');
+    if (!wantQueue) {
       queueColumn.innerHTML = '';
       queueColumn.classList.add('hidden');
+      if (!wasHidden) reportCoverRegions();
       return;
     }
     queueColumn.classList.remove('hidden');
 
-    /* R22：Esc / 选项菜单打开时自动隐藏队列列。
-       原判据是 model.paused，而那是 ScenarioClass::IsGamePaused——多人局按 Esc
-       不会置位，所以这条自动隐藏从来没触发过。改看桥的 menu_open
-       （可见 #32770 对话框 或 OwnerDraw 对话框栈深度>0）。
-       开关 hide_queue_on_menu 默认开；与手动开关（hidden 类）互不干扰：
-       手动关=hidden，菜单=menu-hide，二者任一生效即隐藏。 */
+    /* R22：Esc / 选项菜单打开时自动隐藏队列列。 */
     var hideOnMenu = !(window.__CTRL_STATE && window.__CTRL_STATE.hide_queue_on_menu === false);
-    queueColumn.classList.toggle('menu-hide',
-      hideOnMenu && !!activeModel().menuOpen);
-    /* R23：队列列被收起/恢复会改变遮挡区域，重报一次 */
-    reportCoverRegions();
+    var wantMenuHide = hideOnMenu && !!activeModel().menuOpen;
+    var wasMenuHide = queueColumn.classList.contains('menu-hide');
+    queueColumn.classList.toggle('menu-hide', wantMenuHide);
+    /* R23：仅当队列列显隐态变化时才重报遮挡区域 */
+    if (wasHidden || wasMenuHide !== wantMenuHide) reportCoverRegions();
 
     /* 列数与格子尺寸都由 applyAnchors 的 applyQueueGeometry 按面板实际宽度
        反算（侧栏窄时缩小图标而不是减列），这里只读结果，不做二次兜底。 */
@@ -1632,7 +1657,7 @@
     };
   }
 
-  function applyAnchors(g, hudX, hudY, u) {
+  function applyAnchors(g, hudX, hudY, u, hudDesignW) {
     var vx = (g.x - hudX) / u;
     var vy = (g.y - hudY) / u;
     var vw = g.w / u;
@@ -1715,7 +1740,9 @@
        用 HUD 设计层的实际右边界（hudRight），不用 canvasW/u——
        后者是"画布能容下多少设计像素"，当 HUD 层居中留边时它比实际可用宽度大。 */
     var gameW = geom ? geom.gameW : vw;
-    var hudRight = vx + 1920;   /* HUD 设计层宽固定 1920，右边界 = 左偏移 + 1920 */
+    /* HUD 设计层的右边界恒为设计容器宽度（常规 1920，非 16:9 覆盖层为 W/u），
+       不再误加 vx 导致 16:10/留边下把右栏推到画布外裁切。 */
+    var hudRight = hudDesignW || 1920;
     var railInLeft = vx >= railW + gap * 2;
     var railInRight = (hudRight - (vx + gameW)) >= railW + gap * 2;
 
@@ -1749,11 +1776,10 @@
     queueColumn.style.height = qH + 'px';
     queueColumn.style.bottom = 'auto';
     queueColumn.classList.toggle('live-geom', !!geom);
-    /* 队列是 HUD 的一部分，不是"覆盖原版建造栏"的装饰：
-       演示页里关掉「游戏 UI」就连同假侧栏一起隐藏；
-       覆盖层模式没有本地假侧栏（游戏是 OBS 的独立采集源），只受「生产队列」开关控制。 */
-    queueColumn.style.display =
-      (queueChk.checked && (state.overlay || gameUiChk.checked)) ? '' : 'none';
+    /* 统一走 .hidden class 控制队列显隐，不再写死行内 style.display:none */
+    queueColumn.style.display = '';
+    queueColumn.classList.toggle('hidden',
+      !(queueChk.checked && (state.overlay || gameUiChk.checked)));
 
     /* 队列几何：先按"3 列放得下就用原尺寸"试，放不下就等比缩小图标，
        而不是直接减列 —— 减列会让 6 条通道从 2 行变 6 行，把面板拉得老长。
@@ -1824,17 +1850,27 @@
     stage.style.height = H + 'px';
 
     var u = Math.min(W / 1920, H / 1080);
-    var hudW = 1920 * u;
-    var hudH = 1080 * u;
-    var hudX = (W - hudW) / 2;
-    var hudY = (H - hudH) / 2;
+    var hudDesignW, hudDesignH, hudX, hudY, area;
+    if (state.overlay) {
+      /* 覆盖层模式：窗口/OBS 源本身就是游戏容器，直接铺满容器避免非 16:9（16:10/4:3/21:9）
+         先裁进 16:9 再二次 fitRect 造成双重留边与队列列错位。 */
+      hudDesignW = W / u;
+      hudDesignH = H / u;
+      hudX = 0;
+      hudY = 0;
+      area = { x: 0, y: 0, w: W, h: H };
+    } else {
+      hudDesignW = 1920;
+      hudDesignH = 1080;
+      hudX = (W - 1920 * u) / 2;
+      hudY = (H - 1080 * u) / 2;
+      area = { x: hudX, y: hudY, w: 1920 * u, h: 1080 * u };
+    }
 
+    hudScaler.style.width = hudDesignW + 'px';
+    hudScaler.style.height = hudDesignH + 'px';
     hudScaler.style.transform = 'translate(' + hudX + 'px,' + hudY + 'px) scale(' + u + ')';
 
-    var area = { x: hudX, y: hudY, w: 1920 * u, h: 1080 * u };
-    /* 游戏矩形必须落在 HUD 设计层（area）里，两种模式一致。
-       覆盖层模式下 OBS 浏览器源就是游戏采集源的尺寸，W/H 与游戏同比例 → area 正好铺满；
-       若源尺寸设错（比例不符），HUD 会按 area 居中留边，不会跟着歪。 */
     var g = fitRect(area, aspect);
 
     game.style.left = g.x + 'px';
@@ -1843,7 +1879,7 @@
     game.style.height = g.h + 'px';
     game.style.fontSize = (g.w / 100) + 'px';
 
-    applyAnchors(g, hudX, hudY, u);
+    applyAnchors(g, hudX, hudY, u, hudDesignW);
 
     state._u = u;
     state._hudX = hudX;
@@ -1909,15 +1945,30 @@
       return false;
     }
 
+    function screenSig(m) {
+      var sc = m && m.screen;
+      if (!sc || !sc.valid) return '';
+      return [
+        sc.width || 0, sc.height || 0, sc.sidebar_side || 0,
+        (sc.view_rect || []).join(','),
+        (sc.sidebar_rect || []).join(',')
+      ].join('|');
+    }
+    function obsState(m) {
+      return m && m.observer ? (m.observer.is_observer ? 1 : 0) : -1;
+    }
+
+    /* 仅布局结构变化才返回 changed=true 触发全量 applyLayout()；
+       frame/map/paused 变化只走增量 renderHeader/renderTopBar/renderRails/renderQueues。 */
     var changed =
       !prev ||
-      prev.meta.frame !== model.meta.frame ||
+      prev.ok !== model.ok ||
       prev.teams.length !== model.teams.length ||
-      prev.map !== model.map ||
-      prev.paused !== model.paused ||
       prev.menuOpen !== model.menuOpen ||
       prev.perTeam !== model.perTeam ||
-      prev.meta.pid !== model.meta.pid;
+      prev.meta.pid !== model.meta.pid ||
+      screenSig(prev) !== screenSig(model) ||
+      obsState(prev) !== obsState(model);
 
     state.liveModel = model;
     state.liveError = '';
@@ -1978,6 +2029,7 @@
           renderFauxMap();
           relayoutAndRender();
         } else {
+          if (stage.classList.contains('live-offline')) return;
           renderHeader();
           renderTopBar();
           renderRails();
@@ -2074,40 +2126,42 @@
     stage.classList.toggle('live-stale', stale);
     stage.classList.toggle('live-error', live && !!state.liveError);
     if (!el) return;
+    /* 覆盖层/无工具栏模式下 #liveStatus 隐藏，跳过 250ms 周期 DOM 写操作 */
+    if (typeof document !== 'undefined' && document.body &&
+        document.body.classList.contains('no-chrome')) return;
 
+    var nextText, nextCls;
     if (!live) {
-      el.textContent = '';
-      el.className = 'live-status';
-      return;
+      nextText = '';
+      nextCls = 'live-status';
+    } else if (!m) {
+      nextText = state.liveError ? '连接失败：' + state.liveError : '等待数据…';
+      nextCls = 'live-status' + (state.liveError ? ' bad' : '');
+    } else {
+      var bits = [];
+      if (state.liveError) bits.push('连接失败：' + state.liveError);
+      /* 对局外保留上一局名单，但 phase 仍以当前桥输出决定显隐。 */
+      if (ph === 'no_client') bits.push('客户端未启动');
+      else if (ph === 'lobby') bits.push('已进大厅，等待开局');
+      else if (ph === 'loading') bits.push('对局加载中');
+      else if (ph === 'post_match') bits.push('本局已结束');
+      else if (!m.ok) bits.push('未进入对局');
+      else bits.push('pid ' + m.meta.pid, 'frame ' + m.meta.frame);
+      bits.push('schema ' + m.meta.schema);
+      if (stale) bits.push(Math.floor(ageMs / 1000) + 's 未更新');
+      if (matchLike) {
+        if (m.meta.out_of_sync) bits.push('不同步');
+        if (m.ffa) bits.push('多阵营已并入两列');
+        if (m.dropped_observer_houses) bits.push('剔除观察者房 ' + m.dropped_observer_houses);
+      }
+      nextText = bits.join(' · ');
+      nextCls = 'live-status' +
+        (state.liveError ? ' bad' : '') +
+        (stale ? ' stale' : '') +
+        (!m.ok ? ' wait' : '');
     }
-    if (!m) {
-      el.textContent = state.liveError ? '连接失败：' + state.liveError : '等待数据…';
-      el.className = 'live-status' + (state.liveError ? ' bad' : '');
-      return;
-    }
-
-    var bits = [];
-    if (state.liveError) bits.push('连接失败：' + state.liveError);
-    /* 对局外保留上一局名单，但 phase 仍以当前桥输出决定显隐。 */
-    if (ph === 'no_client') bits.push('客户端未启动');
-    else if (ph === 'lobby') bits.push('已进大厅，等待开局');
-    else if (ph === 'loading') bits.push('对局加载中');
-    else if (ph === 'post_match') bits.push('本局已结束');
-    else if (!m.ok) bits.push('未进入对局');
-    else bits.push('pid ' + m.meta.pid, 'frame ' + m.meta.frame);
-    bits.push('schema ' + m.meta.schema);
-    if (stale) bits.push(Math.floor(ageMs / 1000) + 's 未更新');
-    if (matchLike) {
-      if (m.meta.out_of_sync) bits.push('不同步');
-      if (m.ffa) bits.push('多阵营已并入两列');
-      if (m.dropped_observer_houses) bits.push('剔除观察者房 ' + m.dropped_observer_houses);
-    }
-
-    el.textContent = bits.join(' · ');
-    el.className = 'live-status' +
-      (state.liveError ? ' bad' : '') +
-      (stale ? ' stale' : '') +
-      (!m.ok ? ' wait' : '');
+    if (el.textContent !== nextText) el.textContent = nextText;
+    if (el.className !== nextCls) el.className = nextCls;
   }
 
   /* ---------------------------------------------------------------- events */
@@ -2131,31 +2185,34 @@
      和 OBS 浏览器源虽然也是 overlay 形态，但尺寸/位置不同，报了会污染判定。
      没有 mo_hud（file:// 或 serve.py）时 fetch 静默失败，不影响渲染。
      上报时机：布局变化后（relayoutAndRender）与窗口 resize；节流 300 ms。 */
-  var reportTimer = null, lastRegions = '';
+  var reportTimer = null, lastRegions = '', lastRegionsSentAt = 0;
+  var REGIONS_HEARTBEAT_MS = 10000;
 
   function coverRegionRects() {
-    var els = [
-      document.querySelector('.top-bar'),
-      document.querySelector('.rail-left'),
-      document.querySelector('.rail-right'),
-      document.getElementById('queueColumn')
-    ];
     var out = [];
-    /* 用视口坐标：采样线程算出的光标坐标也是覆盖层客户区 CSS px */
-    for (var i = 0; i < els.length; i++) {
-      var el = els[i];
-      if (!el) continue;
+    function collectEl(el) {
+      if (!el) return;
       var cs = getComputedStyle(el);
-      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-      /* 手动关掉的队列列（.hidden）与 Esc 菜单收起的（.menu-hide）都不遮挡 */
-      if (el.classList.contains('hidden') || el.classList.contains('menu-hide')) continue;
+      if (cs.display === 'none' || cs.visibility === 'hidden') return;
+      if (el.classList.contains('hidden') || el.classList.contains('menu-hide')) return;
       var r = el.getBoundingClientRect();
-      if (r.width < 1 || r.height < 1) continue;
+      if (r.width < 1 || r.height < 1) return;
       out.push([
         Math.round(r.left), Math.round(r.top),
         Math.round(r.width), Math.round(r.height)
       ]);
     }
+    collectEl(document.querySelector('.top-bar'));
+    /* 仅测量可见的 .rp 玩家卡片，避免把整条透明 .rail 外壳当遮挡区 */
+    ['.rail-left', '.rail-right'].forEach(function (sel) {
+      var rail = document.querySelector(sel);
+      if (!rail || rail.classList.contains('empty') || rail.classList.contains('hidden')) return;
+      var rcs = getComputedStyle(rail);
+      if (rcs.display === 'none' || rcs.visibility === 'hidden') return;
+      var cards = rail.querySelectorAll('.rp');
+      for (var i = 0; i < cards.length; i++) collectEl(cards[i]);
+    });
+    collectEl(document.getElementById('queueColumn'));
     return out;
   }
 
@@ -2168,13 +2225,15 @@
     }, 300);
   }
 
-  /* 真正发送。低频兜底轮询也直接用它（跳过 300ms 节流）。 */
+  /* 真正发送：矩形变化立即发，无变化时每 10 秒心跳续期一次避免 30s STALE 过期破坏 R23。 */
   function sendCoverRegions() {
     if (!/[?&]cursorregions=1/.test(location.search)) return;
     var rects = coverRegionRects();
     var sig = JSON.stringify(rects);
-    if (sig === lastRegions) return;   /* 矩形没变就不重复发 */
+    var now = Date.now();
+    if (sig === lastRegions && (now - lastRegionsSentAt) < REGIONS_HEARTBEAT_MS) return;
     lastRegions = sig;
+    lastRegionsSentAt = now;
     fetch('/cursor/regions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2183,10 +2242,9 @@
   }
 
   window.addEventListener('resize', reportCoverRegions);
-  /* 兜底：有代码路径直接改 class 而不经过 relayoutAndRender/renderQueues
-     （如 control-bridge.js 切「生产队列」时直接 toggle .hidden），
-     靠 1 秒一次的矩形签名比对兜住。4 次 getBoundingClientRect/秒可忽略。 */
-  setInterval(sendCoverRegions, 1000);
+  var regionsTimer = /[?&]cursorregions=1/.test(location.search)
+    ? setInterval(sendCoverRegions, 1000)
+    : null;
 
   function tick() {
     if (state.source === 'live') return;
@@ -2572,17 +2630,20 @@
     if (event.persisted && state.source === 'live') restartLive();
   });
 
-  /* 闪烁回归指标：live 500 ms 轮询不应销毁任何 <img>；
-     若回归到 innerHTML 全量重建，这里会每帧上涨（写进 probe 的 imgRecycled）。 */
+  var probeOn = /[?&]probe=1/.test(location.search);
   var imgRecycled = 0;
-  new MutationObserver(function (muts) {
-    for (var i = 0; i < muts.length; i++) {
-      var rm = muts[i].removedNodes;
-      for (var j = 0; j < rm.length; j++) {
-        if (rm[j].nodeName === 'IMG') imgRecycled++;
+  var probeObserver = null;
+  if (probeOn && typeof MutationObserver !== 'undefined') {
+    probeObserver = new MutationObserver(function (muts) {
+      for (var i = 0; i < muts.length; i++) {
+        var rm = muts[i].removedNodes;
+        for (var j = 0; j < rm.length; j++) {
+          if (rm[j].nodeName === 'IMG') imgRecycled++;
+        }
       }
-    }
-  }).observe(document.body, { childList: true, subtree: true });
+    });
+    probeObserver.observe(document.body, { childList: true, subtree: true });
+  }
 
   ensureIndexes();
   renderFauxMap();
@@ -2591,60 +2652,78 @@
   setSource('mock');
   bootFromQuery();
 
-  /* R10：控制台切换"顶栏左上让位"后重排顶栏——applyLayout 只随数据/窗口尺寸
-     触发，body.yield-tl 的增删不在其列，control-bridge 派发本事件补一拍。 */
+  /* R10：控制台切换"顶栏左上让位"后重排顶栏 */
   window.addEventListener('ctrl-yield', function () { applyLayout(); });
 
-  /* R22：控制台切换「Esc 菜单时隐藏生产队列」后立即重算一次。
-     demo.js 在 control-bridge.js 之后加载，开关值由它写在 window.__CTRL_STATE 上。 */
+  /* R22：控制台切换「Esc 菜单时隐藏生产队列」后立即重算一次 */
   window.addEventListener('ctrl-queue-hide', function () { renderQueues(); });
 
-  /* R12：控制台改图标覆盖/隐藏配置后重展开 + 全量重渲染一次（事件驱动，
-     不新增轮询；渲染路径上的额外成本只有 OVR[id]/HIDDEN[id] 两次查找）。 */
+  /* P1-8：控制台切换单位栏/队列列/观察者门槛/比分或编辑顶栏文案后立即重绘（暂停态同样生效） */
+  window.addEventListener('ctrl-layout', function () { relayoutAndRender(); });
+  window.addEventListener('ctrl-text', function () { renderHeader(); });
+
+  /* R12：控制台改图标覆盖/隐藏配置后重展开 + 全量重渲染一次 */
   rebuildUnitCustom();
   window.addEventListener('ctrl-units', function () {
     rebuildUnitCustom();
     relayoutAndRender();
   });
 
-  /* R29：支援技能开关/优先顺序/隐藏名单变化 → 整层重排。
-     必须走 relayoutAndRender 而不是只重画侧栏：1v1 的 rail 宽度与列数
-     都由这些开关决定（开了才放宽到两列），只重画卡片会留下错位的几何。 */
+  /* R29：支援技能开关/优先顺序/隐藏名单变化 → 整层重排 */
   window.addEventListener('ctrl-supers', function () { relayoutAndRender(); });
 
-  /* R13 光标指示器：游戏是自绘光标（画在游戏画面里，位于覆盖层之下），
-     移到不透明面板上就"消失"。exe 侧 /cursor/sse 推全局光标的覆盖层坐标，
-     页内画一枚标记浮在面板之上；OBS 浏览器源同页可见（观赛流也受益）。
-     非 exe 模式 404 → CLOSED 后关闭连接，静默降级。 */
-  if (window.EventSource) {
+  /* R13 光标指示器：控制台预览 iframe 带 ?nocursor=1 不建 /cursor/sse 连接；
+     静止光标不再 400ms 误杀，仅在收到 {"on":false}/SSE 异常或超过 5.5s 断流兜底时隐藏。 */
+  var cursorEs = null;
+  var cursorHideT = null;
+  var noCursor = /[?&]nocursor=1/.test(location.search);
+  if (window.EventSource && !noCursor) {
     (function () {
       var marker = document.createElement('div');
       marker.className = 'cur-ind';
       document.body.appendChild(marker);
-      var hideT = null;
-      var es = new EventSource('/cursor/sse');
-      es.onmessage = function (e) {
+      cursorEs = new EventSource('/cursor/sse');
+      cursorEs.onmessage = function (e) {
         try {
           var d = JSON.parse(e.data);
           if (!d || d.on === false || typeof d.x !== 'number') {
+            clearTimeout(cursorHideT);
             marker.style.display = 'none';
             return;
           }
           marker.style.transform = 'translate(' + d.x + 'px,' + d.y + 'px)';
           marker.style.display = 'block';
-          clearTimeout(hideT);
-          hideT = setTimeout(function () { marker.style.display = 'none'; }, 400);
+          clearTimeout(cursorHideT);
+          /* 配合后端 2s 静止保活心跳，仅作连接异常断流兜底 */
+          cursorHideT = setTimeout(function () { marker.style.display = 'none'; }, 5500);
         } catch (err) { /* 忽略坏帧 */ }
       };
-      es.onerror = function () {
-        if (es.readyState === EventSource.CLOSED) es.close();
+      cursorEs.onerror = function () {
+        clearTimeout(cursorHideT);
+        marker.style.display = 'none';
+        if (cursorEs && cursorEs.readyState === EventSource.CLOSED) {
+          cursorEs.close();
+          cursorEs = null;
+        }
       };
     })();
   }
 
-  setInterval(tick, 1000);
+  var tickTimer = setInterval(tick, 1000);
+  var probeInitTimer = null, probeLoopTimer = null;
+  if (probeOn) {
+    probeInitTimer = setTimeout(writeProbe, 1600);
+    probeLoopTimer = setInterval(writeProbe, 1000);
+  }
 
-  /* probe 需要等 live 首次拉取和布局稳定 */
-  setTimeout(writeProbe, 1600);
-  setInterval(writeProbe, 1000);
+  window.addEventListener('pagehide', function () {
+    if (cursorEs) { cursorEs.close(); cursorEs = null; }
+    if (cursorHideT) { clearTimeout(cursorHideT); cursorHideT = null; }
+    if (regionsTimer) { clearInterval(regionsTimer); regionsTimer = null; }
+    if (reportTimer) { clearTimeout(reportTimer); reportTimer = null; }
+    if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+    if (probeInitTimer) { clearTimeout(probeInitTimer); probeInitTimer = null; }
+    if (probeLoopTimer) { clearInterval(probeLoopTimer); probeLoopTimer = null; }
+    if (probeObserver) { probeObserver.disconnect(); probeObserver = null; }
+  });
 })();

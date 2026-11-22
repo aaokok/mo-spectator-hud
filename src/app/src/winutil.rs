@@ -1,6 +1,6 @@
 //! Win32 进程/窗口/显示器的只读工具（桥、跟随、环境自检共用）
 
-use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows_sys::Win32::Foundation::{BOOL, CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, POINT, RECT};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
     TH32CS_SNAPPROCESS,
@@ -8,8 +8,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClientRect, GetWindowLongW, GetWindowThreadProcessId, IsIconic,
-    IsWindowVisible, SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos, GWL_EXSTYLE,
-    HWND_TOPMOST, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    IsWindow, IsWindowVisible, SetLayeredWindowAttributes, SetWindowLongW, SetWindowPos, GWL_EXSTYLE,
+    HWND_TOPMOST, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
 };
 
 pub const WS_EX_TRANSPARENT: i32 = 0x20;
@@ -25,7 +25,7 @@ pub fn layered_commit_visible(hwnd: isize) {
     }
 }
 
-/// 硬置顶兜底：有些游戏会抢 topmost，跟随线程可周期性重调
+/// 硬置顶兜底：只调整 Z-order，不带 SWP_SHOWWINDOW，避免把已隐藏窗口强行弹出
 pub fn force_topmost(hwnd: isize) {
     unsafe {
         SetWindowPos(
@@ -35,7 +35,7 @@ pub fn force_topmost(hwnd: isize) {
             0,
             0,
             0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
 }
@@ -48,23 +48,46 @@ pub fn add_click_through_bits(hwnd: isize) {
     }
 }
 
+struct SnapGuard(HANDLE);
+
+impl Drop for SnapGuard {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+/// UTF-16 NUL 结尾缓冲区与目标进程名做大小写无关比较；纯 ASCII 零堆分配。
+fn utf16_eq_ignore_case(wide: &[u16], target: &str) -> bool {
+    let len = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+    if target.is_ascii() {
+        let bytes = target.as_bytes();
+        if len != bytes.len() {
+            return false;
+        }
+        wide[..len]
+            .iter()
+            .zip(bytes.iter())
+            .all(|(&c, &b)| c < 128 && (c as u8).eq_ignore_ascii_case(&b))
+    } else {
+        String::from_utf16_lossy(&wide[..len]).to_lowercase() == target.to_lowercase()
+    }
+}
+
 /// 按进程名（大小写不敏感）找 pid
 pub fn find_pid_by_name(exe_name: &str) -> Option<u32> {
-    let exe = exe_name.to_ascii_lowercase();
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snap.is_null() || snap as isize == -1 {
+        if snap.is_null() || snap == INVALID_HANDLE_VALUE {
             return None;
         }
+        let _guard = SnapGuard(snap);
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
         if Process32FirstW(snap, &mut entry) != 0 {
             loop {
-                let name = String::from_utf16_lossy(
-                    &entry.szExeFile[..entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(0)],
-                )
-                .to_ascii_lowercase();
-                if name == exe {
+                if utf16_eq_ignore_case(&entry.szExeFile, exe_name) {
                     return Some(entry.th32ProcessID);
                 }
                 if Process32NextW(snap, &mut entry) == 0 {
@@ -76,8 +99,77 @@ pub fn find_pid_by_name(exe_name: &str) -> Option<u32> {
     None
 }
 
+/// 单次进程快照批量查询多个目标进程，返回命中的进程名列表（按 `names` 去重保序）
+pub fn find_running_processes(names: &[&str]) -> Vec<String> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let mut matched = vec![false; names.len()];
+    let mut remaining = names.len();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap.is_null() || snap == INVALID_HANDLE_VALUE {
+            return Vec::new();
+        }
+        let _guard = SnapGuard(snap);
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                for (i, target) in names.iter().enumerate() {
+                    if !matched[i] && utf16_eq_ignore_case(&entry.szExeFile, target) {
+                        matched[i] = true;
+                        remaining -= 1;
+                    }
+                }
+                if remaining == 0 || Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &n)| matched[i].then(|| n.to_string()))
+        .collect()
+}
+
 pub fn process_running(exe_name: &str) -> bool {
     find_pid_by_name(exe_name).is_some()
+}
+
+/// 校验已缓存的 `(hwnd, pid)` 是否仍然有效并直接取客户区矩形，避免每拍全系统快照与 EnumWindows。
+/// 窗口最小化时仍视为有效（返回 `(0, 0, 0, 0)`，由调用方通过 `is_iconic_w` 区分）。
+pub fn cached_window_rect(hwnd: isize, expected_pid: u32) -> Option<(i32, i32, i32, i32)> {
+    if hwnd == 0 || expected_pid == 0 {
+        return None;
+    }
+    unsafe {
+        if IsWindow(hwnd as _) == 0 || IsWindowVisible(hwnd as _) == 0 {
+            return None;
+        }
+        if window_pid(hwnd) != expected_pid {
+            return None;
+        }
+        if IsIconic(hwnd as _) != 0 {
+            return Some((0, 0, 0, 0));
+        }
+        let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        if GetClientRect(hwnd as _, &mut rc) == 0 {
+            return None;
+        }
+        let w = rc.right - rc.left;
+        let h = rc.bottom - rc.top;
+        if w < 200 || h < 150 {
+            return None;
+        }
+        let mut pt = POINT { x: 0, y: 0 };
+        if ClientToScreen(hwnd as _, &mut pt) == 0 {
+            return None;
+        }
+        Some((pt.x, pt.y, w, h))
+    }
 }
 
 /// 某 pid 下面积最大的可见窗口，保留窗口句柄（R10 失焦隐藏需要用 hwnd
@@ -142,6 +234,22 @@ pub fn window_pid(hwnd: isize) -> u32 {
     let mut pid: u32 = 0;
     unsafe { GetWindowThreadProcessId(hwnd as _, &mut pid) };
     pid
+}
+
+/// 前台窗口是否就是 `game_hwnd` 或属于同一进程（如 Esc 弹出的选项对话框）。
+pub fn is_foreground_of_window_pid(game_hwnd: isize) -> bool {
+    if game_hwnd == 0 {
+        return false;
+    }
+    let fg = foreground_hwnd();
+    if fg == 0 {
+        return false;
+    }
+    if fg == game_hwnd {
+        return true;
+    }
+    let fp = window_pid(fg);
+    fp != 0 && fp == window_pid(game_hwnd)
 }
 
 /// 全局光标位置（R13 光标指示器：只读本进程 API，不碰游戏）
@@ -291,6 +399,47 @@ mod tests {
         let mut bad = synth_pe(0x108, 0x014C, 4, 0x3BDF_544E);
         bad[0x3c..0x40].copy_from_slice(&0x20u32.to_le_bytes());
         assert_eq!(pe_timestamp_from(&bad), None);
+    }
+
+    #[test]
+    fn utf16_process_name_matching_is_case_insensitive_and_nul_terminated() {
+        let mut buf = [0u16; 32];
+        for (i, ch) in "GameMD.EXE".encode_utf16().enumerate() {
+            buf[i] = ch;
+        }
+        buf[11] = 'X' as u16; // NUL 之后的垃圾字符不应影响比对
+        assert!(super::utf16_eq_ignore_case(&buf, "gamemd.exe"));
+        assert!(super::utf16_eq_ignore_case(&buf, "GAMEMD.EXE"));
+        assert!(!super::utf16_eq_ignore_case(&buf, "gamemd.ex"));
+        assert!(!super::utf16_eq_ignore_case(&buf, "gamemd.exe2"));
+    }
+
+    #[test]
+    fn snapshot_queries_do_not_leak_handles() {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+        let mut before = 0u32;
+        let mut after = 0u32;
+        // 预热一次
+        let _ = super::find_pid_by_name("__nonexistent_mo_hud_proc__.exe");
+        unsafe {
+            assert_ne!(GetProcessHandleCount(GetCurrentProcess(), &mut before), 0);
+        }
+        for _ in 0..100 {
+            assert!(super::find_pid_by_name("__nonexistent_mo_hud_proc__.exe").is_none());
+        }
+        let _ = super::find_running_processes(&[
+            "__nonexistent_1__.exe",
+            "__nonexistent_2__.exe",
+            "explorer.exe",
+        ]);
+        unsafe {
+            assert_ne!(GetProcessHandleCount(GetCurrentProcess(), &mut after), 0);
+        }
+        // 未关闭句柄的话这里会暴涨 >= 101；留小余量避免并发测试线程波动
+        assert!(
+            after <= before + 16,
+            "handle count leaked: before={before}, after={after}"
+        );
     }
 
     /// 真实文件口径：本机若存在 YR 1.001 的 gamemd.exe，必须解析出 0x3BDF544E。

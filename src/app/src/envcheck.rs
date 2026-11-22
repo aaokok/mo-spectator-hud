@@ -245,9 +245,11 @@ fn check_display() -> CheckReport {
 }
 
 fn check_av() -> CheckReport {
+    let names: Vec<&str> = AV_PROCESSES.iter().map(|(n, _)| *n).collect();
+    let running = crate::winutil::find_running_processes(&names);
     let mut found: Vec<&str> = Vec::new();
     for (name, label) in AV_PROCESSES {
-        if crate::winutil::process_running(name) && !found.contains(label) {
+        if running.iter().any(|r| r.eq_ignore_ascii_case(name)) && !found.contains(label) {
             found.push(*label);
         }
     }

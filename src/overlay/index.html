@@ -203,23 +203,26 @@
    常开 + 去重 + 上限 20 条：渲染循环里同一个错误每帧都会抛，
    不设上限会把运行日志和 _probe_error.log 刷爆。 */
 (function () {
-  var seen = {}, sent = 0, MAX = 20;
+  var seen = Object.create(null), sent = 0, MAX = 20, reporting = false;
   function report(kind, payload) {
-    if (sent >= MAX) return;
-    var key = kind + '|' + payload.msg;
+    if (reporting || sent >= MAX) return;
+    var key = kind + '|' + String((payload && payload.msg) || '');
     if (seen[key]) { seen[key]++; return; }
     seen[key] = 1;
     sent++;
     payload.kind = kind;
     payload.page = 'overlay';
     payload.url = location.href;
+    reporting = true;
     try {
       fetch('/probe-error', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
-      });
-    } catch (e) {}
+      }).catch(function () {});
+    } catch (e) {} finally {
+      reporting = false;
+    }
   }
   window.addEventListener('error', function (e) {
     report('error', { msg: String(e.message), src: e.filename, line: e.lineno, col: e.colno });

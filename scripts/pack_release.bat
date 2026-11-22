@@ -35,22 +35,44 @@ if not exist "src\app\target\release\mo_hud.exe" (
 )
 
 echo.
-echo [2/4] Syncing frontend and console...
-if not exist "%RELEASE_DIR%\demo" mkdir "%RELEASE_DIR%\demo"
-xcopy /e /y /q "src\overlay" "%RELEASE_DIR%\demo\" >nul
+echo [2/4] Cleaning old asset dirs and syncing frontend/console...
+if exist "%RELEASE_DIR%\demo" rmdir /s /q "%RELEASE_DIR%\demo"
+if exist "%RELEASE_DIR%\hud" rmdir /s /q "%RELEASE_DIR%\hud"
+if exist "%RELEASE_DIR%\icons" rmdir /s /q "%RELEASE_DIR%\icons"
+if exist "%RELEASE_DIR%\icons_manifest.json" del /f /q "%RELEASE_DIR%\icons_manifest.json"
+if exist "%RELEASE_DIR%\heroes.json" del /f /q "%RELEASE_DIR%\heroes.json"
+
+mkdir "%RELEASE_DIR%\demo"
+robocopy "src\overlay" "%RELEASE_DIR%\demo" /E /NFL /NDL /NJH /NJS /NC /NS /NP ^
+    /XD tests _pcx __pycache__ ^
+    /XF *.log *.log.* _probe*.log _panic.log _control.json mo_hud.ini serve.py *.bat README.md *.pcx *.test.cjs
+if errorlevel 8 (
+    echo [!] Failed to sync src\overlay
+    exit /b 1
+)
 echo  - Synced overlay (src/overlay to release/demo)
 
-if not exist "%RELEASE_DIR%\hud" mkdir "%RELEASE_DIR%\hud"
-xcopy /e /y /q "src\console" "%RELEASE_DIR%\hud\" >nul
+mkdir "%RELEASE_DIR%\hud"
+robocopy "src\console" "%RELEASE_DIR%\hud" /E /NFL /NDL /NJH /NJS /NC /NS /NP ^
+    /XD tests __pycache__ ^
+    /XF *.log *.log.* _probe*.log _panic.log _control.json mo_hud.ini README.md
+if errorlevel 8 (
+    echo [!] Failed to sync src\console
+    exit /b 1
+)
 echo  - Synced web console (src/console to release/hud)
 
 echo.
-echo [3/4] Syncing icons and metadata...
-if not exist "%RELEASE_DIR%\icons" mkdir "%RELEASE_DIR%\icons"
-xcopy /e /y /q "assets\icons" "%RELEASE_DIR%\icons\" >nul
-copy /y "assets\icons_manifest.json" "%RELEASE_DIR%\" >nul
-copy /y "assets\heroes.json" "%RELEASE_DIR%\" >nul
-echo  - Synced 532 Cameo icons and data dictionaries
+echo [3/4] Syncing icons...
+mkdir "%RELEASE_DIR%\icons"
+robocopy "assets\icons" "%RELEASE_DIR%\icons" /E /NFL /NDL /NJH /NJS /NC /NS /NP ^
+    /XD _pcx __pycache__ ^
+    /XF *.pcx morph_map.json _unique_icons.json _sw_manifest.json *.log *.log.*
+if errorlevel 8 (
+    echo [!] Failed to sync assets\icons
+    exit /b 1
+)
+echo  - Synced Cameo icons (excluding build leftovers)
 
 echo.
 echo [4/4] Ensuring runtime directory...
@@ -72,3 +94,4 @@ echo.
 if not "%1"=="--no-pause" (
     pause
 )
+exit /b 0

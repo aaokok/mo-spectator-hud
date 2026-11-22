@@ -8,6 +8,8 @@ const App = window.App;
 const $ = window.$;
 
 let allLines = [];      // 原始日志
+let lastSeq = -1;       // 服务端单调递增日志序号（满 500 行仍可准确检测新日志）
+let lastSig = '';       // 数据内容签名，无变化跳过 innerHTML 重建（不打断选中文字）
 let level = '';
 let query = '';
 let manualPause = false;
@@ -87,20 +89,44 @@ function setPaused(paused, auto) {
   updateFoot(visible());
 }
 
-/** 主控每 2 秒调用 */
-function setLines(lines) {
+function setUnread(show) {
+  const pill = $('logNew');
+  if (pill) pill.classList.toggle('show', !!show);
+}
+
+/** 主控每 2 秒调用（仅在日志页可见时触发） */
+function setLines(lines, seq) {
+  const next = lines || [];
+  const nextTail = next.length ? next[next.length - 1] : '';
+  const sig = `${typeof seq === 'number' ? seq : 'x'}|${next.length}|${nextTail}`;
+  if (sig === lastSig) return;
+
+  const isFirst = lastSig === '';
   const prevCount = allLines.length;
-  allLines = lines || [];
-  const grew = allLines.length > prevCount;
-  // 在底部且未手动暂停 → 保持跟随
+  const prevTail = prevCount ? allLines[prevCount - 1] : '';
+  const grew = typeof seq === 'number' && lastSeq >= 0
+    ? seq > lastSeq
+    : (next.length > prevCount || (next.length > 0 && nextTail !== prevTail));
+
+  lastSig = sig;
+  if (typeof seq === 'number') lastSeq = seq;
+  allLines = next;
+
+  const box = $('logbox');
+  const prevScrollTop = box ? box.scrollTop : 0;
   const atBottom = nearBottom();
   render();
-  if (grew && !manualPause && (atBottom || prevCount === 0)) {
+  if (isFirst || (grew && !manualPause && atBottom)) {
     scrollBottom();
     autoPaused = false;
     setPaused(false, true);
-  } else if (grew && (manualPause || !atBottom)) {
-    if (!manualPause) setPaused(true, true);
+    setUnread(false);
+  } else {
+    if (box) box.scrollTop = prevScrollTop;
+    if (grew && (manualPause || !atBottom)) {
+      if (!manualPause) setPaused(true, true);
+      setUnread(true);
+    }
   }
 }
 
@@ -128,14 +154,16 @@ function init() {
       manualPause = false;
       autoPaused = false;
       setPaused(false, false);
+      setUnread(false);
       scrollBottom();
     }
   };
 
-  // 滚离底部自动暂停；回到底部自动恢复
+  // 滚离底部自动暂停；回到底部自动恢复并收起「新日志」提示
   $('logbox').addEventListener('scroll', () => {
-    if (manualPause) return;
     const atBottom = nearBottom();
+    if (atBottom) setUnread(false);
+    if (manualPause) return;
     if (!atBottom && !autoPaused) setPaused(true, true);
     else if (atBottom && autoPaused) setPaused(false, true);
   }, { passive: true });
@@ -148,9 +176,16 @@ function init() {
     manualPause = false;
     autoPaused = false;
     setPaused(false, false);
+    setUnread(false);
     scrollBottom();
   };
 }
 
-App.registerPage('logs', { init, setLines });
+App.registerPage('logs', {
+  init,
+  setLines,
+  onShow: () => {
+    if (App.refreshLog) App.refreshLog();
+  },
+});
 })();

@@ -1,6 +1,6 @@
 [package]
 name = "mo_hud"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "MO 观战 HUD 应用外壳（Tauri 2）：内嵌服务 + 桥托管 + 覆盖窗口 + 控制台"
 

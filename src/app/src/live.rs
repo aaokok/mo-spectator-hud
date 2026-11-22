@@ -18,6 +18,7 @@ use tokio_stream::wrappers::WatchStream;
 use tokio_stream::Stream;
 
 const CHECK_INTERVAL: Duration = Duration::from_millis(20);
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_millis(80);
 const HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -53,8 +54,10 @@ impl SourceSignature {
 
 #[derive(Debug)]
 struct Snapshot {
-    data: Value,
+    data: Arc<Value>,
+    compact_json: Arc<str>,
     raw: Arc<[u8]>,
+    mtime_ms: u64,
     signature: SourceSignature,
     age: SourceAge,
 }
@@ -80,6 +83,16 @@ impl CacheState {
         wall_now: SystemTime,
         now: Instant,
     ) -> Result<bool, String> {
+        let bytes_changed = self
+            .snapshot
+            .as_ref()
+            .map(|s| s.raw.as_ref() != raw.as_slice())
+            .unwrap_or(true);
+        if !bytes_changed {
+            // 原文字节完全一致：跳过 JSON 解析与深度比较，只清理可能存在的旧错
+            let recovered = self.error.take().is_some();
+            return Ok(recovered);
+        }
         let data: Value = serde_json::from_slice(&raw).map_err(|e| format!("状态 JSON 无效: {e}"))?;
         if !data.is_object() {
             return Err("状态 JSON 必须是对象".into());
@@ -89,12 +102,8 @@ impl CacheState {
         }
         let signature = SourceSignature::of(&data);
         let previous = self.snapshot.as_ref();
-        let content_changed = previous.map(|s| s.data != data).unwrap_or(true);
-        let bytes_changed = previous.map(|s| s.raw.as_ref() != raw.as_slice()).unwrap_or(true);
-        let recovered = self.error.take().is_some();
-        if !content_changed && !bytes_changed {
-            return Ok(recovered);
-        }
+        let content_changed = previous.map(|s| s.data.as_ref() != &data).unwrap_or(true);
+        let _recovered = self.error.take().is_some();
         // 首份文件可能早已陈旧；以后只认签名推进，用单调钟累计年龄。
         // 同签名即使其它字段变化/文件被重写，也不能洗掉停摆时间。
         // mtime 只初始化年龄，不拿墙钟推算桥 ts。
@@ -104,10 +113,28 @@ impl CacheState {
             Some(_) => SourceAge { initial: Duration::ZERO, at: now },
             None => SourceAge { initial, at: now },
         };
+        let compact_json: Arc<str> = if content_changed {
+            serde_json::to_string(&data)
+                .map_err(|e| format!("状态 JSON 序列化失败: {e}"))?
+                .into()
+        } else {
+            previous.expect("previous 必存在").compact_json.clone()
+        };
+        let mtime_ms = mtime
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         if content_changed {
             self.seq += 1;
         }
-        self.snapshot = Some(Arc::new(Snapshot { data, raw: raw.into(), signature, age }));
+        self.snapshot = Some(Arc::new(Snapshot {
+            data: Arc::new(data),
+            compact_json,
+            raw: raw.into(),
+            mtime_ms,
+            signature,
+            age,
+        }));
         Ok(true)
     }
 
@@ -183,6 +210,22 @@ impl LiveCache {
         (snapshot.raw.as_ref() == raw).then(|| snapshot.age.age_ms(Instant::now()))
     }
 
+    /// 供 /app/status 与 /app/summary 零磁盘 I/O 读取最新已解析快照与文件时间。
+    pub fn latest_snapshot(&self) -> Option<(Arc<Value>, u64)> {
+        let state = self.inner.latest.borrow();
+        let snapshot = state.snapshot.as_ref()?;
+        Some((snapshot.data.clone(), snapshot.mtime_ms))
+    }
+
+    fn has_subscribers(&self) -> bool {
+        self.inner.latest.receiver_count() > 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_for_test(&self, raw: Vec<u8>, mtime: SystemTime, now: Instant) -> bool {
+        self.accept(raw, mtime, mtime, now)
+    }
+
     pub fn stream(&self) -> LiveStream {
         let mut health = tokio::time::interval_at(
             tokio::time::Instant::now() + HEALTH_INTERVAL,
@@ -218,29 +261,50 @@ impl FileStamp {
     }
 }
 
-/// 失败不提交文件标识：下一次 20 ms tick 会重试，不会因相同 mtime 永久卡住。
+const ERROR_BACKOFF_MS: [u64; 5] = [20, 50, 100, 250, 500];
+
+/// 失败不提交文件标识，并按指数退避重试，避免损坏文件/非 UTF-8 触发 50 Hz 刷盘风暴。
 async fn observe(cache: LiveCache, path: PathBuf) {
-    let mut interval = tokio::time::interval(CHECK_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut previous = None;
+    let mut previous: Option<FileStamp> = None;
+    let mut last_failed_stamp: Option<FileStamp> = None;
     let mut retry = true;
+    let mut err_streak: usize = 0;
     loop {
-        interval.tick().await;
+        let delay = if err_streak == 0 {
+            if cache.has_subscribers() || retry {
+                CHECK_INTERVAL
+            } else {
+                IDLE_CHECK_INTERVAL
+            }
+        } else {
+            Duration::from_millis(ERROR_BACKOFF_MS[err_streak.min(ERROR_BACKOFF_MS.len() - 1)])
+        };
+        tokio::time::sleep(delay).await;
+
         let stamp = match FileStamp::read(&path).await {
             Ok(stamp) => stamp,
             Err(error) => {
                 retry = true;
+                last_failed_stamp = None;
+                err_streak = (err_streak + 1).min(ERROR_BACKOFF_MS.len() - 1);
                 cache.fail(error);
                 continue;
             }
         };
         if !retry && previous.as_ref() == Some(&stamp) {
+            err_streak = 0;
             continue;
+        }
+        // 文件元信息在出错后发生了变化，立刻清零退避以尽快恢复。
+        if last_failed_stamp.as_ref() != Some(&stamp) {
+            err_streak = 0;
         }
         let raw = match tokio::fs::read(&path).await {
             Ok(raw) => raw,
             Err(error) => {
                 retry = true;
+                last_failed_stamp = Some(stamp);
+                err_streak = (err_streak + 1).min(ERROR_BACKOFF_MS.len() - 1);
                 cache.fail(format!("状态文件读取失败: {error}"));
                 continue;
             }
@@ -250,11 +314,15 @@ async fn observe(cache: LiveCache, path: PathBuf) {
             Ok(after) if after == stamp => {}
             Ok(_) => {
                 retry = true;
+                last_failed_stamp = None;
+                err_streak = (err_streak + 1).min(ERROR_BACKOFF_MS.len() - 1);
                 cache.fail("状态文件读取期间发生变化".into());
                 continue;
             }
             Err(error) => {
                 retry = true;
+                last_failed_stamp = None;
+                err_streak = (err_streak + 1).min(ERROR_BACKOFF_MS.len() - 1);
                 cache.fail(error);
                 continue;
             }
@@ -262,16 +330,13 @@ async fn observe(cache: LiveCache, path: PathBuf) {
         retry = !cache.accept(raw, stamp.modified, SystemTime::now(), Instant::now());
         if !retry {
             previous = Some(stamp);
+            last_failed_stamp = None;
+            err_streak = 0;
+        } else {
+            last_failed_stamp = Some(stamp);
+            err_streak = (err_streak + 1).min(ERROR_BACKOFF_MS.len() - 1);
         }
     }
-}
-
-#[derive(Serialize)]
-struct SnapshotEvent<'a> {
-    session: &'a str,
-    seq: u64,
-    source_age_ms: u64,
-    data: &'a Value,
 }
 
 #[derive(Serialize)]
@@ -283,7 +348,7 @@ struct HealthEvent<'a> {
 }
 
 /// 无连接后台任务、无 FIFO。WatchStream 只保留最新完整状态；连接 drop 即释放
-/// receiver 和健康计时器。事件 JSON/年龄在实际 poll 输出时才生成。
+/// receiver 和健康计时器。快照主体已在 accept() 预序列化一次，多连接直接复用。
 pub struct LiveStream {
     updates: WatchStream<Arc<CacheState>>,
     current: Arc<CacheState>,
@@ -318,12 +383,15 @@ impl Stream for LiveStream {
                 if this.last_error.is_none() && current.error.is_none() {
                     this.last_error = Some(None);
                 }
-                let event = Event::default().event("snapshot").json_data(SnapshotEvent {
-                    session: &current.session,
-                    seq: current.seq,
-                    source_age_ms: snapshot.age.age_ms(now),
-                    data: &snapshot.data,
-                }).expect("桥状态 JSON 对象应可序列化");
+                let session_json =
+                    serde_json::to_string(&current.session).expect("session 应可序列化");
+                let payload = format!(
+                    "{{\"session\":{session_json},\"seq\":{},\"source_age_ms\":{},\"data\":{}}}",
+                    current.seq,
+                    snapshot.age.age_ms(now),
+                    snapshot.compact_json
+                );
+                let event = Event::default().event("snapshot").data(payload);
                 return Poll::Ready(Some(Ok(event)));
             }
         }
@@ -421,7 +489,7 @@ mod tests {
         data["extra"] = json!({"unknown": [1, 2, 3]});
         state.accept(serde_json::to_vec(&data).unwrap(), wall(), wall(), now + Duration::from_secs(4)).unwrap();
         assert_eq!(state.seq, 2);
-        assert_eq!(state.snapshot.as_ref().unwrap().data, data);
+        assert_eq!(state.snapshot.as_ref().unwrap().data.as_ref(), &data);
         assert_eq!(state.source_age_ms(now + Duration::from_secs(4)), Some(4_000));
     }
 
@@ -482,7 +550,7 @@ mod tests {
         second.accept(legacy.clone(), wall(), wall(), Instant::now()).unwrap();
         assert_eq!(first.seq, 1);
         assert_eq!(second.seq, 1);
-        assert_eq!(first.snapshot.as_ref().unwrap().data, serde_json::from_slice::<Value>(&legacy).unwrap());
+        assert_eq!(first.snapshot.as_ref().unwrap().data.as_ref(), &serde_json::from_slice::<Value>(&legacy).unwrap());
     }
 
     #[test]
@@ -606,6 +674,37 @@ mod tests {
         // 未消费过的连接只能看到当前快照，不会按写入次数回放。
         assert_eq!(frame(&mut stream).await.0, "health");
         assert_eq!(frame(&mut stream).await.1["seq"], 2);
+        task.abort();
+        let _ = task.await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn watcher_handles_invalid_utf8_and_recovers_cleanly() {
+        let dir = std::env::temp_dir().join(format!("mo-hud-utf8-{}", new_session()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("hud_state.json");
+        // 含非法 GBK 字节的 JSON
+        std::fs::write(&path, b"{\"ok\":true,\"players\":[],\"map\":\"\xb2\xe2\xca\xd4\"}").unwrap();
+        let cache = LiveCache::new();
+        let task = tokio::spawn(cache.watcher(path.clone()).unwrap());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while cache.inner.latest.borrow().error.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(cache.inner.latest.borrow().error.as_deref().unwrap_or("").contains("无效"));
+        // 写入合法 UTF-8 后必须在退避周期内恢复
+        std::fs::write(&path, raw(9, 100)).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while cache.inner.latest.borrow().seq != 1 || cache.inner.latest.borrow().error.is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         task.abort();
         let _ = task.await;
         std::fs::remove_dir_all(dir).unwrap();

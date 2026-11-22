@@ -18,23 +18,35 @@ use crate::config::AppState;
 
 const GAME_PROC: &str = "gamemd.exe";
 const TICK_MS: u64 = 100;
+const IDLE_TICK_MS: u64 = 400;
 
 pub fn start(app: tauri::AppHandle, state: Arc<AppState>) {
     std::thread::spawn(move || {
         let mut last: Option<(i32, i32, i32, i32)> = None;
+        let mut cached: Option<(u32, isize)> = None;
         let mut had_game = false;
         loop {
-            std::thread::sleep(Duration::from_millis(TICK_MS));
-            let pid = crate::winutil::find_pid_by_name(GAME_PROC);
-            match pid.and_then(crate::winutil::find_main_window) {
-                Some((hwnd, rect)) => {
-                    *state.game_hwnd.lock().unwrap() = hwnd;   // R13 光标指示器共用
+            std::thread::sleep(Duration::from_millis(if had_game { TICK_MS } else { IDLE_TICK_MS }));
+            let found = cached
+                .and_then(|(pid, hwnd)| {
+                    crate::winutil::cached_window_rect(hwnd, pid).map(|rect| (pid, hwnd, rect))
+                })
+                .or_else(|| {
+                    let pid = crate::winutil::find_pid_by_name(GAME_PROC)?;
+                    let (hwnd, rect) = crate::winutil::find_main_window(pid)?;
+                    Some((pid, hwnd, rect))
+                });
+            match found {
+                Some((pid, hwnd, rect)) => {
+                    cached = Some((pid, hwnd));
+                    state.game_hwnd.store(hwnd, Ordering::Relaxed);   // R13 光标指示器共用
                     if !had_game {
-                        state.log(format!("找到游戏窗口（pid={pid:?}），覆盖层开始跟随"));
+                        state.log(format!("找到游戏窗口（pid={pid}），覆盖层开始跟随"));
                         had_game = true;
                     }
                     let iconic = crate::winutil::is_iconic_w(hwnd);
-                    let focused = crate::winutil::foreground_hwnd() == hwnd;
+                    // R23：前台放宽到同游戏进程，游戏中按 Esc 弹选项对话框不误隐藏覆盖层
+                    let focused = crate::winutil::is_foreground_of_window_pid(hwnd);
                     if focused {
                         // 前台回归后，手动钉住失效，交还自动权
                         state.ov_user_pin.store(false, Ordering::Relaxed);
@@ -61,12 +73,14 @@ pub fn start(app: tauri::AppHandle, state: Arc<AppState>) {
                     }
                 }
                 None => {
-                    *state.game_hwnd.lock().unwrap() = 0;
+                    cached = None;
+                    state.game_hwnd.store(0, Ordering::Relaxed);
                     if had_game {
                         state.log("游戏窗口消失，覆盖层停在原位（可用热键手动隐藏）");
                         had_game = false;
                     }
                     last = None;
+                    state.ov_user_pin.store(false, Ordering::Relaxed);
                     if state.ov_auto_hidden.swap(false, Ordering::Relaxed) {
                         crate::shell::apply_overlay_flags(&state);
                     }

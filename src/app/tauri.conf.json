@@ -1,10 +1,10 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "MO Spectator HUD",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "identifier": "com.mospectator.hud",
   "build": {
-    "frontendDist": "../console"
+    "frontendDist": "dist"
   },
   "app": {
     "windows": [],
@@ -17,11 +17,23 @@
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
     "resources": {
-      "../overlay": "demo/",
-      "../console": "hud/",
+      "../overlay/*.html": "demo/",
+      "../overlay/*.css": "demo/",
+      "../overlay/*.js": "demo/",
+      "../overlay/assets/*.js": "demo/assets/",
+      "../overlay/assets/flags/*.png": "demo/assets/flags/",
+      "../overlay/assets/icons/*": "demo/assets/icons/",
+      "../overlay/custom_icons/README.txt": "demo/custom_icons/README.txt",
+      "../console/*.html": "hud/",
+      "../console/*.css": "hud/",
+      "../console/*.js": "hud/",
+      "../console/pages/*.js": "hud/pages/",
+      "../console/img/*": "hud/img/",
       "../bridge/hud_bridge.exe": "hud_bridge.exe",
       "../bridge/unit_count_rules.default.ini": "unit_count_rules.default.ini",
-      "../../assets/icons": "icons/"
+      "../../assets/icons/*.png": "icons/",
+      "../../assets/icons/byid/*.png": "icons/byid/",
+      "../../assets/icons/sw/*.png": "icons/sw/"
     }
   }
 }

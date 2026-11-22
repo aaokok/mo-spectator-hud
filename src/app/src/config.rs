@@ -1,6 +1,6 @@
 ﻿use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -185,7 +185,7 @@ impl Default for CtrlState {
             score_l: 0,
             score_r: 0,
             mode_label: String::new(),
-            yield_top_left: true,
+            yield_top_left: false,
             auto_hide_on_blur: true,
             unit_icon_overrides: String::new(),
             hidden_units: String::new(),
@@ -342,14 +342,10 @@ impl Ini {
                     "overlay_topmost" => ini.overlay_topmost = v == "1" || v == "true",
                     "hotkey_enabled" => ini.hotkey_enabled = v == "1" || v == "true",
                     "hotkey_visible" => {
-                        if !v.is_empty() {
-                            ini.hotkey_visible = v.to_lowercase();
-                        }
+                        ini.hotkey_visible = v.to_lowercase();
                     }
                     "hotkey_topmost" => {
-                        if !v.is_empty() {
-                            ini.hotkey_topmost = v.to_lowercase();
-                        }
+                        ini.hotkey_topmost = v.to_lowercase();
                     }
                     _ => {}
                 }
@@ -387,6 +383,8 @@ pub struct AppState {
     pub port: AtomicU16,
     pub ctrl: Mutex<CtrlState>,
     pub log: Mutex<VecDeque<String>>,
+    /// 单调递增日志序号：满 500 行淘汰旧行后，前端仍可据 seq 判断有新日志并自动滚底
+    pub log_seq: AtomicU64,
     /// 覆盖层：用户开关（显隐 / 置顶）
     pub ov_visible: AtomicBool,
     pub ov_topmost: AtomicBool,
@@ -395,9 +393,9 @@ pub struct AppState {
     pub ov_auto_hidden: AtomicBool,
     /// 覆盖层：热键手动"显示"后的临时钉住（失焦也不藏），前台回归即失效
     pub ov_user_pin: AtomicBool,
-    /// R13 光标指示器：覆盖层/游戏窗口句柄（0=未知），跟随线程与 setup 写入
-    pub overlay_hwnd: Mutex<isize>,
-    pub game_hwnd: Mutex<isize>,
+    /// R13 光标指示器：覆盖层/游戏窗口句柄（0=未知），原子存取避免 67Hz 锁争用
+    pub overlay_hwnd: AtomicIsize,
+    pub game_hwnd: AtomicIsize,
     /// R13 光标指示器：采样线程 → /cursor/sse（broadcast，无订阅者时零流量）
     pub cursor_tx: tokio::sync::broadcast::Sender<String>,
     /// 桥状态共享缓存及唯一文件观察者，独立于光标采样通道。
@@ -465,18 +463,19 @@ impl AppState {
             port: AtomicU16::new(0),
             ctrl: Mutex::new(ctrl),
             log: Mutex::new(VecDeque::new()),
+            log_seq: AtomicU64::new(0),
             ov_visible: AtomicBool::new(true),
             ov_topmost: AtomicBool::new(ov_topmost),
             ov_auto_hidden: AtomicBool::new(false),
             ov_user_pin: AtomicBool::new(false),
-            overlay_hwnd: Mutex::new(0),
-            game_hwnd: Mutex::new(0),
+            overlay_hwnd: AtomicIsize::new(0),
+            game_hwnd: AtomicIsize::new(0),
             cursor_tx: cursor_tx.clone(),
             live: crate::live::LiveCache::new(),
             cursor_regions: Mutex::new(None),
             hotkey_status: Mutex::new(HotkeyStatus {
                 enabled: hotkey_enabled,
-                ok: false,
+                ok: !hotkey_enabled,
                 error: String::new(),
             }),
             bridge: Mutex::new(BridgeInfo {
@@ -507,6 +506,7 @@ impl AppState {
             while q.len() > 500 {
                 q.pop_front();
             }
+            self.log_seq.fetch_add(1, Ordering::Relaxed);
         }
         append_log_file(&self.paths.app_root, &line);
         println!("{line}");
@@ -568,4 +568,35 @@ pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ini_load_honors_explicit_empty_hotkeys() {
+        let dir = std::env::temp_dir().join(format!("mo-ini-hk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mo_hud.ini");
+        std::fs::write(
+            &path,
+            "game_dir=\ninterval_ms=250\noverlay_topmost=false\nhotkey_enabled=true\nhotkey_visible=\nhotkey_topmost=ctrl+shift+t\n",
+        )
+        .unwrap();
+        let ini = Ini::load(&path);
+        assert_eq!(ini.interval_ms, 250);
+        assert!(!ini.overlay_topmost);
+        assert!(ini.hotkey_enabled);
+        assert_eq!(ini.hotkey_visible, "", "显式空值不应复活默认 ctrl+alt+h");
+        assert_eq!(ini.hotkey_topmost, "ctrl+shift+t");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ctrl_default_yield_top_left_is_off() {
+        let ctrl = CtrlState::default();
+        assert!(!ctrl.yield_top_left, "顶栏左上让位默认应关闭");
+    }
 }
